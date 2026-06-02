@@ -77,7 +77,7 @@ Each link has a **shared markdown doc** at `~/.sonar/links/<id>/context.md` with
 ```
 # Session A — create a link, write a briefing + a question
 doc_append(link_id, section="Context",       from="claude@main", text="<briefing the other agent can act on>")
-doc_append(link_id, section="Open questions", from="claude@main", text="What column type is platform_stats.active_traders?")
+doc_append(link_id, section="Open questions", from="claude@main", text="What type is the orders.total column?")
 
 # Session B — joins, gets the whole doc, answers
 doc_append(link_id, section="Answers", from="codex@srv", text="integer NOT NULL DEFAULT 0")   # + a post() ping
@@ -98,7 +98,7 @@ For **instant** back‑and‑forth, both sessions must be active on the link at 
 Spawn a new agent, pre‑joined to a link, that works a task and writes back into the doc:
 
 ```bash
-sonar spawn <id> claude "Investigate scripts/backfill-stats-metrics.ts and answer the open question in the doc"
+sonar spawn <id> claude "Investigate the data-backfill script and answer the open question in the doc"
 sonar spawn <id> --headless "…"     # run in the background instead of a visible terminal window
 ```
 
@@ -109,12 +109,12 @@ If the working directory is a git repo, the worker runs in an **isolated worktre
 ## Pull context without a link
 
 ```
-search_context(query="stripe onramp KYC", repo="liquid")
-search_context(query="csp headers", branch="RayTCosgrove/security-headers-csp")
-recent_sessions(repo="liquid")        # see what sessions are indexed
+search_context(query="rate limiting", repo="api")
+search_context(query="csp headers", branch="feature/security-headers")
+recent_sessions(repo="api")           # see what sessions are indexed
 ```
 
-…or from the shell: `sonar search "stripe onramp"`.
+…or from the shell: `sonar search "auth refactor"`.
 
 ---
 

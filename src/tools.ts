@@ -198,7 +198,7 @@ export function registerTools(server: McpServer) {
       description:
         "Full-text search across your indexed Claude Code AND Codex conversation history. Use this to pull context from another session by topic — optionally filtered by branch, repo, or agent. Branch filtering is exact for Claude sessions (Codex logs don't record branch; filter by repo instead).",
       inputSchema: {
-        query: z.string().describe('What to look for, e.g. "stripe onramp KYC" or "auth refactor".'),
+        query: z.string().describe('What to look for, e.g. "rate limiting" or "auth refactor".'),
         branch: z.string().optional().describe('Restrict to a git branch (Claude sessions).'),
         repo: z.string().optional().describe('Restrict to a repo name.'),
         agent: z.string().optional().describe('"claude" or "codex".'),
