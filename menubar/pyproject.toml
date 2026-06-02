@@ -1,0 +1,9 @@
+[project]
+name = "sonar-bar"
+version = "0.1.0"
+description = "macOS menu bar control panel for sonar — view/kill/browse/start Claude Code & Codex sessions."
+requires-python = ">=3.12,<3.13"
+dependencies = ["pyobjc-framework-WebKit>=10.0"]
+
+[tool.uv]
+package = false

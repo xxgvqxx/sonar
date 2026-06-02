@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sonar</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-elev: #f4f4f6;
+    --row-hover: #ececef;
+    --text: #1d1d1f;
+    --dim: #76767c;
+    --faint: #a0a0a6;
+    --border: rgba(0,0,0,.07);
+    --accent: #007aff;
+    --danger: #ff3b30;
+    --green: #2bbf4e;
+    --claude: #c2603c;
+    --codex: #10a37f;
+    --shadow: 0 1px 2px rgba(0,0,0,.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1c1e;
+      --bg-elev: #2c2c2e;
+      --row-hover: #3a3a3d;
+      --text: #f5f5f7;
+      --dim: #9a9aa0;
+      --faint: #6a6a70;
+      --border: rgba(255,255,255,.09);
+      --accent: #0a84ff;
+      --danger: #ff453a;
+      --green: #32d74b;
+      --claude: #e08a63;
+      --codex: #1abf97;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    font: 13px/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    color: var(--text); background: var(--bg);
+    -webkit-font-smoothing: antialiased; user-select: none; cursor: default;
+    overflow: hidden;
+  }
+  #app { display: flex; flex-direction: column; height: 100vh; width: min(100vw, 400px); }
+
+  /* header */
+  header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 11px 12px 9px; border-bottom: 1px solid var(--border);
+    -webkit-app-region: drag;
+  }
+  .brand { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13px; flex: none; }
+  .glyph { width: 16px; height: 16px; color: var(--accent); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; color: var(--dim); min-width: 0; max-width: 150px;
+    padding: 3px 8px; border-radius: 99px; background: var(--bg-elev);
+  }
+  .pill span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pill .dot { width: 7px; height: 7px; border-radius: 99px; background: var(--green); flex: none; }
+  .pill.down .dot { background: var(--danger); }
+  .spacer { flex: 1; }
+  .iconbtn {
+    width: 26px; height: 26px; display: grid; place-items: center;
+    border-radius: 7px; color: var(--dim); transition: background .12s, color .12s;
+  }
+  .iconbtn:hover { background: var(--row-hover); color: var(--text); }
+  .iconbtn svg { width: 15px; height: 15px; }
+
+  /* search */
+  .searchwrap { padding: 9px 12px 4px; }
+  .search {
+    display: flex; align-items: center; gap: 7px;
+    background: var(--bg-elev); border-radius: 8px; padding: 6px 9px;
+  }
+  .search svg { width: 14px; height: 14px; color: var(--faint); flex: none; }
+  .search input {
+    border: none; outline: none; background: transparent; color: var(--text);
+    font: inherit; width: 100%;
+  }
+  .search input::placeholder { color: var(--faint); }
+
+  /* scroll body */
+  main { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 8px 8px; }
+  main::-webkit-scrollbar { width: 8px; }
+  main::-webkit-scrollbar-thumb { background: var(--border); border-radius: 99px; }
+
+  .sectitle {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 10.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+    color: var(--faint); padding: 12px 6px 5px;
+  }
+  .count { color: var(--faint); font-weight: 500; }
+
+  /* rows */
+  .row {
+    display: flex; align-items: center; gap: 9px;
+    padding: 7px 8px; border-radius: 9px; transition: background .1s;
+    position: relative;
+  }
+  .row:hover { background: var(--row-hover); }
+  .adot { width: 7px; height: 7px; border-radius: 99px; flex: none; background: transparent; }
+  .adot.on { background: var(--green); box-shadow: 0 0 0 2px color-mix(in srgb, var(--green) 25%, transparent); }
+  .badge {
+    flex: none; font-size: 10px; font-weight: 600; color: #fff;
+    padding: 2px 6px; border-radius: 5px; letter-spacing: .01em;
+  }
+  .badge.claude { background: var(--claude); }
+  .badge.codex { background: var(--codex); }
+  .rowtext { flex: 1; min-width: 0; }
+  .rowtext .t1 {
+    font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .rowtext .t2 {
+    font-size: 11px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .branch { color: var(--dim); font-weight: 400; }
+  .actions { display: flex; align-items: center; gap: 2px; opacity: 0; transition: opacity .1s; flex: none; }
+  .row:hover .actions { opacity: 1; }
+  .act {
+    width: 24px; height: 24px; display: grid; place-items: center; border-radius: 6px;
+    color: var(--dim);
+  }
+  .act:hover { background: var(--bg); color: var(--text); }
+  @media (prefers-color-scheme: dark) { .act:hover { background: #1c1c1e; } }
+  .act.danger:hover { color: #fff; background: var(--danger); }
+  .act svg { width: 14px; height: 14px; }
+  .killbtn {
+    flex: none; font-size: 11px; font-weight: 600; color: var(--danger);
+    border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+    padding: 3px 9px; border-radius: 7px; transition: all .12s;
+  }
+  .killbtn:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
+
+  .empty { color: var(--faint); font-size: 12px; padding: 6px 8px; }
+
+  /* start session */
+  .startbar { display: flex; gap: 7px; padding: 4px 6px 2px; }
+  select, .startbtn {
+    font: inherit; color: var(--text); background: var(--bg-elev);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; outline: none;
+  }
+  select { flex: 1; min-width: 0; -webkit-appearance: none; }
+  .startbtn { font-weight: 600; color: #fff; border: none; padding: 6px 12px; }
+  .startbtn.claude { background: var(--claude); }
+  .startbtn.codex { background: var(--codex); }
+  .startbtn:active { transform: scale(.97); }
+
+  /* footer */
+  footer {
+    border-top: 1px solid var(--border); padding: 7px 10px;
+    display: flex; align-items: center; gap: 4px;
+  }
+  .fbtn { font-size: 12px; color: var(--dim); padding: 5px 8px; border-radius: 7px; }
+  .fbtn:hover { background: var(--row-hover); color: var(--text); }
+  .fbtn.danger:hover { color: var(--danger); }
+
+  /* settings overlay */
+  .settings, .help {
+    position: absolute; inset: 0; background: var(--bg); z-index: 5;
+    display: flex; flex-direction: column; transform: translateX(100%);
+    transition: transform .22s cubic-bezier(.4,0,.2,1);
+  }
+  .settings.open, .help.open { transform: none; }
+  .settings .body, .help .body { flex: 1; overflow-y: auto; padding: 6px 14px 16px; }
+  .sgroup { padding: 14px 0 4px; }
+  .slabel { font-size: 11px; color: var(--dim); margin-bottom: 7px; }
+  .seg { display: flex; background: var(--bg-elev); border-radius: 8px; padding: 2px; gap: 2px; }
+  .seg button {
+    flex: 1; font: inherit; font-size: 12px; color: var(--text); background: transparent;
+    border: none; border-radius: 6px; padding: 5px; transition: background .12s;
+  }
+  .seg button.sel { background: var(--bg); box-shadow: var(--shadow); font-weight: 600; }
+  @media (prefers-color-scheme: dark){ .seg button.sel { background: #48484a; } }
+  .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; border-top: 1px solid var(--border); }
+  .switch { width: 38px; height: 22px; border-radius: 99px; background: var(--row-hover); position: relative; transition: background .15s; }
+  .switch.on { background: var(--green); }
+  .switch .knob { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 99px; background: #fff; transition: left .15s; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+  .switch.on .knob { left: 18px; }
+  .ver { color: var(--faint); font-size: 11px; text-align: center; padding-top: 12px; }
+
+  .hidden { display: none !important; }
+  .fade { animation: fade .18s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; } }
+
+  /* help panel */
+  .help h3 { font-size: 12px; margin: 16px 0 6px; color: var(--text); }
+  .help p { font-size: 12px; color: var(--dim); margin: 4px 0; line-height: 1.45; }
+  .help ul { margin: 4px 0; padding-left: 4px; list-style: none; }
+  .help li { font-size: 12px; color: var(--dim); margin: 4px 0; }
+  .help .cmd, .help code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; background: var(--bg-elev); padding: 1px 5px; border-radius: 5px; color: var(--text); }
+  .help .step { display: flex; gap: 8px; padding: 5px 0; align-items: baseline; }
+  .help .step > div { font-size: 12px; color: var(--dim); line-height: 1.45; }
+  .help .who { flex: none; font-size: 10px; font-weight: 600; color: #fff; padding: 1px 7px; border-radius: 5px; }
+  .help .who.a { background: var(--claude); }
+  .help .who.b { background: var(--codex); }
+
+  /* update / status notice (shown in main) */
+  .notice { padding: 30px 18px; text-align: center; color: var(--dim); font-size: 13px; line-height: 1.55; }
+  .notice.err { color: var(--danger); }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">
+      <svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <path d="M4.5 12a7.5 7.5 0 0 1 15 0"/><path d="M7.5 12a4.5 4.5 0 0 1 9 0"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>
+      </svg>
+      sonar
+    </div>
+    <div class="spacer"></div>
+    <div class="pill" id="status"><span class="dot"></span><span id="statusText">…</span></div>
+    <div class="iconbtn" id="update" title="Update sonar (git pull)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v5h-5"/></svg>
+    </div>
+    <div class="iconbtn" id="help" title="Help & commands">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="12" cy="12" r="9"/><path d="M9.6 9.2a2.4 2.4 0 1 1 3.4 2.2c-.8.4-1.3 1-1.3 1.9" stroke-linecap="round"/><circle cx="12" cy="16.6" r="0.7" fill="currentColor" stroke="none"/></svg>
+    </div>
+    <div class="iconbtn" id="gear" title="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </div>
+  </header>
+
+  <div class="searchwrap">
+    <div class="search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      <input id="filter" placeholder="Filter sessions by repo, branch, agent…" />
+    </div>
+  </div>
+
+  <main id="main"></main>
+
+  <footer>
+    <div class="fbtn" id="newSession">+ Start session</div>
+    <div class="spacer"></div>
+    <div class="fbtn" id="openLog">Logs</div>
+  </footer>
+
+  <!-- help -->
+  <div class="help" id="helpPanel">
+    <header>
+      <div class="iconbtn" id="helpBack"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m15 18-6-6 6-6"/></svg></div>
+      <div class="brand" style="font-size:13px">How sonar works</div>
+    </header>
+    <div class="body">
+      <h3>Link two sessions through a shared doc</h3>
+      <div class="step"><span class="who a">A</span><div>In one terminal: <span class="cmd">/sonar</span> — creates a link (e.g. <code>k7m2</code>) and writes what A is working on into a shared doc.</div></div>
+      <div class="step"><span class="who b">B</span><div>In another terminal: <span class="cmd">/sonar k7m2</span> — B joins, sees the whole doc, and adds context / answers A's open questions.</div></div>
+      <div class="step"><span class="who a">A</span><div>A is pinged the instant B writes, re-reads the doc, and replies. They keep a shared <b>Context · Open questions · Answers · Decisions</b> doc — the source of truth. Async: neither has to be live at once.</div></div>
+      <p>Watch it live: <span class="cmd">sonar doc k7m2 --open</span>, or open <code>~/.sonar/links/k7m2/context.md</code>.</p>
+
+      <h3>No teammate? Dispatch a worker</h3>
+      <p><span class="cmd">/sonar spawn k7m2 "investigate X, answer the open question"</span> — launches a fresh agent in an isolated git branch that does the work and writes back into the doc.</p>
+
+      <h3>Pull context from past sessions</h3>
+      <p><span class="cmd">/sonar search "stripe onramp"</span> — full-text search across your Claude + Codex history (optionally by repo / branch).</p>
+
+      <h3>In a chat (Claude Code)</h3>
+      <ul>
+        <li><span class="cmd">/sonar</span> — create a link</li>
+        <li><span class="cmd">/sonar &lt;id&gt;</span> — join a link</li>
+        <li><span class="cmd">/sonar listen &lt;id&gt;</span> — join and just listen / respond</li>
+        <li><span class="cmd">/sonar spawn &lt;id&gt; &lt;task&gt;</span> — dispatch a worker</li>
+        <li><span class="cmd">/sonar search &lt;text&gt;</span> · <span class="cmd">/sonar list</span></li>
+      </ul>
+      <p style="color:var(--faint);font-size:11px">Codex has no slash commands — ask it to "use the sonar skill to create a link / join k7m2 / search …".</p>
+
+      <h3>In a terminal</h3>
+      <ul>
+        <li><span class="cmd">sonar doc &lt;id&gt; --open</span> — open the shared doc</li>
+        <li><span class="cmd">sonar spawn &lt;id&gt; &lt;task&gt;</span> · <span class="cmd">sonar watch &lt;id&gt;</span></li>
+        <li><span class="cmd">sonar search &lt;q&gt;</span> · <span class="cmd">sonar rm &lt;id&gt;</span> · <span class="cmd">sonar reindex</span></li>
+      </ul>
+      <p style="color:var(--faint);font-size:11px;padding-top:8px">Tip: click ⟳ (top) to pull the latest sonar from GitHub.</p>
+    </div>
+  </div>
+
+  <!-- settings -->
+  <div class="settings" id="settings">
+    <header>
+      <div class="iconbtn" id="backBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m15 18-6-6 6-6"/></svg>
+      </div>
+      <div class="brand" style="font-size:13px">Settings</div>
+    </header>
+    <div class="body">
+      <div class="sgroup">
+        <div class="slabel">Start sessions in</div>
+        <div class="seg" id="termSeg">
+          <button data-t="ghostty">Ghostty</button>
+          <button data-t="terminal">Terminal</button>
+          <button data-t="iterm">iTerm</button>
+        </div>
+      </div>
+      <div class="toggle-row">
+        <div>Start at login</div>
+        <div class="switch" id="loginSwitch"><div class="knob"></div></div>
+      </div>
+      <div class="toggle-row" id="stopHubRow">
+        <div>Stop sonar hub</div>
+        <div class="killbtn" id="stopHub">Stop</div>
+      </div>
+      <div class="toggle-row">
+        <div>Quit sonar bar</div>
+        <div class="killbtn" id="quitBtn">Quit</div>
+      </div>
+      <div class="ver" id="ver">sonar</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---- native bridge (RPC) ----
+const __p = {}; let __id = 0;
+function host(action, params = {}) {
+  return new Promise((resolve, reject) => {
+    const id = ++__id; __p[id] = { resolve, reject };
+    try { window.webkit.messageHandlers.sonar.postMessage(JSON.stringify({ id, action, params })); }
+    catch (e) { reject(e); }
+  });
+}
+window.__sonarResolve = (id, r) => { const p = __p[id]; if (p) { p.resolve(r); delete __p[id]; } };
+window.__sonarReject  = (id, e) => { const p = __p[id]; if (p) { p.reject(e); delete __p[id]; } };
+
+// ---- icons ----
+const I = {
+  open:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 17 17 7M9 7h8v8"/></svg>',
+  doc:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 3v5h5"/><path d="M7 3h7l5 5v11a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/></svg>',
+  folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h8a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/></svg>',
+  copy:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg>',
+};
+
+// ---- state / render ----
+let STATE = { health: null, procs: [], sessions: [], repos: [], config: {}, login: false };
+let FILTER = '';
+let showStart = false;
+
+function relTime(iso) {
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 60) return Math.max(0, s | 0) + 's ago';
+  if (s < 3600) return (s / 60 | 0) + 'm ago';
+  if (s < 86400) return (s / 3600 | 0) + 'h ago';
+  return (s / 86400 | 0) + 'd ago';
+}
+const tilde = (p) => p ? p.replace(/^\/Users\/[^/]+/, '~') : '?';
+const esc = (s) => (s ?? '').toString().replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function badge(agent) { const a = agent === 'codex' ? 'codex' : 'claude'; return `<span class="badge ${a}">${a}</span>`; }
+
+function matches(s) {
+  if (!FILTER) return true;
+  return [s.agent, s.repo, s.branch, s.cwd].join(' ').toLowerCase().includes(FILTER);
+}
+
+function actBtns(buttons) {
+  return `<div class="actions">${buttons.map(b =>
+    `<div class="act ${b.danger ? 'danger' : ''}" data-act="${b.act}" data-arg="${esc(b.arg)}" title="${b.title}">${b.icon}</div>`).join('')}</div>`;
+}
+
+function render() {
+  const m = document.getElementById('main');
+  const { health, procs, sessions } = STATE;
+
+  // status pill
+  const pill = document.getElementById('status');
+  const txt = document.getElementById('statusText');
+  if (health) {
+    pill.classList.remove('down');
+    txt.textContent = `${(health.indexed_turns ?? 0).toLocaleString()} turns`;
+    pill.title = `sonar hub :${STATE.config.port || 7610} · ${health.links ?? 0} links`;
+  } else {
+    pill.classList.add('down'); txt.textContent = 'hub stopped'; pill.title = '';
+  }
+
+  if (!health) {
+    m.innerHTML = `<div style="text-align:center;padding:40px 16px;color:var(--dim)">
+      <div style="font-size:13px;margin-bottom:12px">sonar hub isn’t running</div>
+      <div class="startbtn codex" id="startHub" style="display:inline-block;cursor:default">Start hub</div></div>`;
+    document.getElementById('startHub').onclick = async () => { await host('startHub'); setTimeout(refresh, 1400); };
+    return;
+  }
+
+  let html = '';
+
+  // start-session panel (toggled by footer "+ Start session"; part of render so the
+  // 4s refresh doesn't wipe it)
+  if (showStart) {
+    const opts = (STATE.repos || []).map(r => `<option value="${esc(r.cwd)}">${esc(r.repo || tilde(r.cwd))}</option>`).join('');
+    html += `<div class="sectitle">Start a session</div>
+      <div class="startbar">
+        <select id="repoSel">${opts}<option value="__other__">Choose folder…</option></select>
+        <div class="startbtn claude" data-start-agent="claude">claude</div>
+        <div class="startbtn codex" data-start-agent="codex">codex</div>
+      </div>`;
+  }
+
+  // running
+  html += `<div class="sectitle">Running <span class="count">${procs.length}</span></div>`;
+  if (!procs.length) html += `<div class="empty">No live claude/codex sessions detected.</div>`;
+  for (const p of procs) {
+    html += `<div class="row fade">
+      <span class="adot on"></span>${badge(p.agent)}
+      <div class="rowtext"><div class="t1">${esc(tilde(p.cwd))}</div><div class="t2">pid ${p.pid}</div></div>
+      ${actBtns([
+        { act: 'openPath', arg: p.cwd, icon: I.folder, title: 'Open folder' },
+        { act: 'copy', arg: p.pid, icon: I.copy, title: 'Copy pid' },
+      ])}
+      <div class="killbtn" data-act="kill" data-arg="${p.pid}">Kill</div></div>`;
+  }
+
+  // recent
+  const list = sessions.filter(matches);
+  html += `<div class="sectitle">Recent sessions <span class="count">${list.length}</span></div>`;
+  if (!list.length) html += `<div class="empty">No matching sessions.</div>`;
+  for (const s of list) {
+    const loc = `${esc(s.repo || tilde(s.cwd))}${s.branch ? `<span class="branch">/${esc(s.branch)}</span>` : ''}`;
+    const btns = [
+      { act: 'openPath', arg: s.path, icon: I.doc, title: 'Open transcript' },
+      { act: 'reveal', arg: s.path, icon: I.folder, title: 'Reveal in Finder' },
+      { act: 'copy', arg: s.session_id, icon: I.copy, title: 'Copy session id' },
+    ];
+    const kill = (s.pids && s.pids.length) ? `<div class="killbtn" data-act="kill" data-arg="${s.pids[0]}">Kill</div>` : '';
+    html += `<div class="row">
+      <span class="adot ${s.active ? 'on' : ''}"></span>${badge(s.agent)}
+      <div class="rowtext"><div class="t1">${loc}</div><div class="t2">${relTime(s.last_iso)} · ${esc(tilde(s.cwd))}</div></div>
+      ${actBtns(btns)}${kill}</div>`;
+  }
+  m.innerHTML = html;
+
+  // bind row actions
+  m.querySelectorAll('[data-act]').forEach(el => {
+    el.onclick = async (e) => {
+      e.stopPropagation();
+      const act = el.dataset.act, arg = el.dataset.arg;
+      if (act === 'kill') { await host('kill', { pid: +arg }); refresh(); }
+      else if (act === 'openPath') await host('openPath', { path: arg });
+      else if (act === 'reveal') await host('reveal', { path: arg });
+      else if (act === 'copy') await host('copy', { text: arg });
+    };
+  });
+
+  // start-session buttons (when the panel is open)
+  m.querySelectorAll('[data-start-agent]').forEach(b => b.onclick = async () => {
+    const sel = m.querySelector('#repoSel').value;
+    const agent = b.dataset.startAgent;
+    showStart = false;
+    if (sel === '__other__') await host('chooseFolderStart', { agent });
+    else await host('startSession', { cwd: sel, agent });
+    render();
+  });
+}
+
+async function refresh() {
+  try { STATE = await host('getState'); } catch (e) { /* keep last */ }
+  render();
+  syncSettings();
+}
+
+// ---- settings ----
+function syncSettings() {
+  const term = STATE.config.terminal || 'ghostty';
+  document.querySelectorAll('#termSeg button').forEach(b => b.classList.toggle('sel', b.dataset.t === term));
+  document.getElementById('loginSwitch').classList.toggle('on', !!STATE.login);
+  document.getElementById('ver').textContent = 'sonar ' + (STATE.health?.version || '');
+}
+document.getElementById('gear').onclick = () => document.getElementById('settings').classList.add('open');
+document.getElementById('backBtn').onclick = () => document.getElementById('settings').classList.remove('open');
+document.getElementById('help').onclick = () => document.getElementById('helpPanel').classList.add('open');
+document.getElementById('helpBack').onclick = () => document.getElementById('helpPanel').classList.remove('open');
+document.getElementById('update').onclick = async () => {
+  const m = document.getElementById('main');
+  m.innerHTML = `<div class="notice">Checking for updates…</div>`;
+  let r;
+  try { r = await host('update'); } catch (e) { r = { ok: false, error: String(e) }; }
+  if (r && r.ok) {
+    m.innerHTML = `<div class="notice">⟳ Updating sonar from GitHub…<br>the menu bar will relaunch in a few seconds.</div>`;
+  } else {
+    m.innerHTML = `<div class="notice err">Can't update.<br>${esc((r && r.error) || 'unknown error')}</div>` +
+      ((r && r.hint) ? `<div class="notice" style="padding-top:0;font-size:12px">${esc(r.hint)}</div>` : '');
+  }
+};
+document.getElementById('termSeg').onclick = async (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  await host('setTerminal', { terminal: b.dataset.t }); refresh();
+};
+document.getElementById('loginSwitch').onclick = async () => { STATE = await host('toggleLogin'); syncSettings(); };
+document.getElementById('stopHub').onclick = async () => { await host('stopHub'); setTimeout(refresh, 800); };
+document.getElementById('quitBtn').onclick = () => host('quit');
+document.getElementById('openLog').onclick = () => host('openLog');
+document.getElementById('newSession').onclick = () => { showStart = !showStart; render(); };
+document.getElementById('filter').addEventListener('input', e => { FILTER = e.target.value.trim().toLowerCase(); render(); });
+
+// ---- loop ----
+// Poll fast (4.5s) only while the popover is open; when closed, tick slowly (~30s)
+// just to keep the menu-bar count vaguely fresh. Native toggles `active` on show/close.
+let active = false, tick = 0;
+window.__setActive = (v) => { active = v; if (v) refresh(); };
+refresh();
+setInterval(() => { tick++; if (active || tick % 7 === 0) refresh(); }, 4500);
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+# node
+node_modules/
+
+# python / uv (menu bar)
+menubar/.venv/
+**/__pycache__/
+*.pyc
+
+# local runtime / os
+*.log
+.DS_Store
