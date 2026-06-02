@@ -144,6 +144,7 @@ Kills are safety‑gated: the hub only kills PIDs it has independently detected 
 sonar install                  wire up Claude Code + Codex + session-init, start hub
 sonar start | stop | status    manage the background hub
 sonar daemon                   run the hub in the foreground
+sonar port <N|auto>            change the hub port (re-registers with Claude/Codex); "auto" picks a free one
 
 sonar doc <id> [--open]        print / open a link's shared context doc
 sonar spawn <id> [claude|codex] <task…> [--headless]   dispatch a worker on a link
@@ -185,6 +186,8 @@ Environment variables (set before `sonar start`):
 | `SONAR_DIR` | `~/.sonar` | data directory (db, pid, logs, links, worktrees) |
 | `SONAR_INDEX_DAYS` | `45` | only index transcripts modified within this many days |
 | `SONAR_INDEX_POLL_MS` | `4000` | how often transcripts are rescanned |
+
+**Port resolution:** `SONAR_PORT` env → `~/.sonar/config.json` (written by `sonar port`) → `7610`. If the port is taken, `sonar install` automatically falls back to the next free one, and `sonar start` points you to `sonar port auto`. Changing the port **re-registers the MCP URL** with Claude Code and Codex and the menu bar follows it automatically — so it stays consistent everywhere.
 
 Menu‑bar settings live in `~/.sonar/menubar.json` (terminal, agents, active window, recent count, icon).
 

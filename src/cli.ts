@@ -1,11 +1,40 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import net from 'node:net';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { BASE_URL, MCP_URL, PID_PATH, LOG_PATH, DATA_DIR, PORT, HOST, VERSION } from './config.ts';
+import { BASE_URL, MCP_URL, PID_PATH, LOG_PATH, DATA_DIR, PORT, HOST, VERSION, CONFIG_FILE, urlFor } from './config.ts';
 
 const SELF = fileURLToPath(import.meta.url);
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function isPortFree(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once('error', () => resolve(false));
+    srv.once('listening', () => srv.close(() => resolve(true)));
+    srv.listen(port, HOST);
+  });
+}
+
+async function findFreePort(from: number): Promise<number> {
+  for (let p = from; p < from + 100; p++) if (await isPortFree(p)) return p;
+  throw new Error(`no free port found near ${from}`);
+}
+
+function writePortConfig(port: number) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  let cfg: any = {};
+  try {
+    cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch {
+    /* new file */
+  }
+  cfg.port = port;
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+}
 
 function isRunning(): number | null {
   try {
@@ -58,10 +87,10 @@ async function cmdDaemon() {
   startServer();
 }
 
-function cmdStart() {
+function spawnDaemon(displayUrl = BASE_URL) {
   const existing = isRunning();
   if (existing) {
-    console.log(`sonar already running (pid ${existing}) on ${BASE_URL}`);
+    console.log(`sonar already running (pid ${existing}) on ${displayUrl}`);
     return;
   }
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -71,7 +100,16 @@ function cmdStart() {
     stdio: ['ignore', out, out],
   });
   child.unref();
-  console.log(`sonar hub starting on ${BASE_URL} (pid ${child.pid}) — logs: ${LOG_PATH}`);
+  console.log(`sonar hub starting on ${displayUrl} (pid ${child.pid}) — logs: ${LOG_PATH}`);
+}
+
+async function cmdStart() {
+  if (!isRunning() && !(await isPortFree(PORT))) {
+    console.log(`Port ${PORT} is in use by another process.`);
+    console.log(`Run "sonar port auto" to move sonar to a free port (it re-registers with Claude/Codex), or free the port.`);
+    return;
+  }
+  spawnDaemon();
 }
 
 function cmdStop() {
@@ -148,14 +186,15 @@ RULES:
 - Live back-and-forth requires the OTHER session to also be running /sonar <id> (or /sonar listen <id>) at the same time. If it is not, tell the user: your writes are saved and will be seen when it joins, but nobody replies until then — or suggest /sonar spawn <id> <task> to dispatch a worker that will respond.
 `;
 
-const CODEX_SKILL = `---
+function codexSkill(url: string): string {
+  return `---
 name: sonar
 description: Collaborate with other Claude Code / Codex sessions via the local sonar MCP server, using a shared markdown doc. Use when the user wants to link this session to another terminal/branch, share or pull context, ask/answer across sessions, or dispatch a worker.
 ---
 
 # sonar
 
-The sonar MCP server (url = "${MCP_URL}") coordinates multiple Claude Code / Codex sessions through a per-link SHARED MARKDOWN DOC that is the source of truth. post/wait are just "the doc changed" pings.
+The sonar MCP server (url = "${url}") coordinates multiple Claude Code / Codex sessions through a per-link SHARED MARKDOWN DOC that is the source of truth. post/wait are just "the doc changed" pings.
 
 Run  git branch --show-current  and  pwd  first. Use label "codex@<branch>", agent "codex".
 
@@ -177,33 +216,38 @@ Run  git branch --show-current  and  pwd  first. Use label "codex@<branch>", age
 
 Live back-and-forth needs the other session active on the same link at the same time; otherwise writes are saved for when it joins, or use spawn_worker.
 `;
+}
 
-function installClaude(): string {
+function installClaude(url: string): string {
   try {
     fs.mkdirSync(CLAUDE_CMD_DIR, { recursive: true });
     fs.writeFileSync(path.join(CLAUDE_CMD_DIR, 'sonar.md'), SLASH_COMMAND);
   } catch (e) {
     return `  slash command: FAILED (${(e as Error).message})`;
   }
-  // register the MCP server with the Claude Code CLI (user scope)
+  // (re)register the MCP server with the Claude Code CLI (user scope). remove-then-add is
+  // idempotent and updates the URL when the port changes.
   try {
-    execFileSync('claude', ['mcp', 'add', '--transport', 'http', '--scope', 'user', 'sonar', MCP_URL], { stdio: 'pipe' });
-    return '  Claude Code: registered MCP server + /sonar command';
+    execFileSync('claude', ['mcp', 'remove', 'sonar', '-s', 'user'], { stdio: 'pipe' });
+  } catch {
+    /* not registered yet */
+  }
+  try {
+    execFileSync('claude', ['mcp', 'add', '--transport', 'http', '--scope', 'user', 'sonar', url], { stdio: 'pipe' });
+    return `  Claude Code: registered MCP server at ${url} + /sonar command`;
   } catch (e) {
-    const msg = (e as Error).message || '';
-    if (/already exists/i.test(msg)) return '  Claude Code: MCP server already registered + /sonar command written';
     return (
-      `  Claude Code: /sonar command written, but auto-registration failed.\n` +
-      `    Run manually:  claude mcp add --transport http --scope user sonar ${MCP_URL}`
+      `  Claude Code: /sonar command written, but auto-registration failed (${(e as Error).message}).\n` +
+      `    Run manually:  claude mcp add --transport http --scope user sonar ${url}`
     );
   }
 }
 
-function installCodex(): string {
+function installCodex(url: string): string {
   const lines: string[] = [];
   try {
     fs.mkdirSync(CODEX_SKILL_DIR, { recursive: true });
-    fs.writeFileSync(path.join(CODEX_SKILL_DIR, 'SKILL.md'), CODEX_SKILL);
+    fs.writeFileSync(path.join(CODEX_SKILL_DIR, 'SKILL.md'), codexSkill(url));
     lines.push('  Codex: sonar skill written');
   } catch (e) {
     lines.push(`  Codex skill: FAILED (${(e as Error).message})`);
@@ -215,11 +259,17 @@ function installCodex(): string {
     } catch {
       /* no config yet */
     }
-    if (cfg.includes('[mcp_servers.sonar]')) {
-      lines.push('  Codex: MCP server already in config.toml');
+    if (/\[mcp_servers\.sonar\]/.test(cfg)) {
+      // update the existing url line within the block
+      const updated = cfg.replace(/(\[mcp_servers\.sonar\][^[]*?url\s*=\s*)"[^"]*"/, `$1"${url}"`);
+      if (updated !== cfg) {
+        fs.writeFileSync(CODEX_CONFIG, updated);
+        lines.push(`  Codex: updated [mcp_servers.sonar] url → ${url}`);
+      } else {
+        lines.push('  Codex: [mcp_servers.sonar] present');
+      }
     } else {
-      const block = `\n[mcp_servers.sonar]\nurl = "${MCP_URL}"\n`;
-      fs.appendFileSync(CODEX_CONFIG, block);
+      fs.appendFileSync(CODEX_CONFIG, `\n[mcp_servers.sonar]\nurl = "${url}"\n`);
       lines.push('  Codex: added [mcp_servers.sonar] to config.toml');
     }
     if (cfg && !/rmcp_client\s*=\s*true/.test(cfg)) {
@@ -283,15 +333,61 @@ function installSessionInit(): string {
   return lines.join('\n');
 }
 
-function cmdInstall() {
-  console.log(`Installing sonar (MCP endpoint ${MCP_URL})\n`);
-  console.log(installClaude());
-  console.log(installCodex());
+function reRegister(port: number): string {
+  const url = urlFor(port);
+  return `${installClaude(url)}\n${installCodex(url)}`;
+}
+
+async function cmdInstall() {
+  // resolve the port: keep current if sonar is already running; else use the configured
+  // port if free, otherwise fall back to the next free one.
+  let port = PORT;
+  if (!isRunning() && !(await isPortFree(PORT))) {
+    port = await findFreePort(PORT + 1);
+    console.log(`Port ${PORT} is in use — sonar will use ${port} instead.\n`);
+  }
+  writePortConfig(port);
+  const url = urlFor(port);
+  console.log(`Installing sonar (MCP endpoint ${url})\n`);
+  console.log(installClaude(url));
+  console.log(installCodex(url));
   console.log(installSessionInit());
   console.log('\nStarting the hub...');
-  cmdStart();
+  spawnDaemon(`http://${HOST}:${port}`);
   console.log('\nDone. Restart Claude Code / Codex so they pick up the new MCP server + session-init note.');
   console.log('Then in either tool: /sonar   (Codex: ask it to use the sonar skill)');
+}
+
+async function cmdPort(args: string[]) {
+  const arg = args[0];
+  // stop the current daemon first so it releases its port
+  const pid = isRunning();
+  if (pid) {
+    try {
+      process.kill(pid);
+    } catch {}
+    try {
+      fs.unlinkSync(PID_PATH);
+    } catch {}
+  }
+  let port: number;
+  if (!arg || arg === 'auto') {
+    await sleep(400);
+    port = await findFreePort(PORT); // PORT is free again now if it was ours
+    console.log(`Auto-selected free port ${port}.`);
+  } else {
+    port = Number(arg);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`invalid port: ${arg}`);
+    // wait briefly for the old daemon to release, then ensure the target is free
+    for (let i = 0; i < 15 && !(await isPortFree(port)); i++) await sleep(120);
+    if (!(await isPortFree(port))) throw new Error(`port ${port} is in use by another process`);
+  }
+  writePortConfig(port);
+  console.log(`sonar port → ${port}`);
+  console.log(reRegister(port));
+  spawnDaemon(`http://${HOST}:${port}`);
+  console.log(`\nMCP endpoint: ${urlFor(port)}`);
+  console.log('Restart Claude Code / Codex to pick up the new MCP URL. The menu bar follows automatically.');
 }
 
 // --------------------------------------------------------------------------
@@ -439,6 +535,7 @@ Daemon:
   sonar install        register MCP with Claude Code & Codex, install /sonar, start hub
   sonar start|stop|status
   sonar daemon         run the hub in the foreground
+  sonar port <N|auto>  change the hub port (re-registers with Claude/Codex); "auto" picks a free one
 
 Terminal helpers (talk to the running hub):
   sonar create [title]
@@ -494,6 +591,8 @@ const run = async () => {
       return cmdReindex();
     case 'worktrees':
       return cmdWorktrees(rest);
+    case 'port':
+      return cmdPort(rest);
     case 'bar':
       return cmdBar(rest);
     case undefined:

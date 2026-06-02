@@ -1,5 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
+import fs from 'node:fs';
 
 export const HOME = os.homedir();
 
@@ -8,9 +9,24 @@ export const DATA_DIR = process.env.SONAR_DIR || path.join(HOME, '.sonar');
 export const DB_PATH = path.join(DATA_DIR, 'sonar.db');
 export const PID_PATH = path.join(DATA_DIR, 'daemon.pid');
 export const LOG_PATH = path.join(DATA_DIR, 'daemon.log');
+/** Persisted runtime config (currently just the chosen port) — source of truth across hub/CLI/menu bar. */
+export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
 export const HOST = '127.0.0.1';
-export const PORT = Number(process.env.SONAR_PORT || 7610);
+export const DEFAULT_PORT = 7610;
+
+function persistedPort(): number | undefined {
+  try {
+    const p = Number(JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')).port);
+    return Number.isInteger(p) && p > 0 ? p : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resolve the port: SONAR_PORT env > ~/.sonar/config.json > default. */
+export const PORT = Number(process.env.SONAR_PORT) || persistedPort() || DEFAULT_PORT;
+export const urlFor = (port: number) => `http://${HOST}:${port}/mcp`;
 export const BASE_URL = `http://${HOST}:${PORT}`;
 export const MCP_URL = `${BASE_URL}/mcp`;
 

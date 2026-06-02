@@ -1,5 +1,6 @@
 import express from 'express';
 import type { Request, Response } from 'express';
+import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -10,7 +11,7 @@ import * as sessions from './sessions.ts';
 import * as docs from './docs.ts';
 import { spawnWorker, listWorktrees, pruneWorktree } from './spawn.ts';
 import { startIndexer, reindexAll } from './indexer.ts';
-import { HOST, PORT, VERSION } from './config.ts';
+import { HOST, PORT, VERSION, PID_PATH } from './config.ts';
 
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
@@ -234,6 +235,17 @@ export function startServer() {
   const server = app.listen(PORT, HOST, () => {
     startIndexer();
     console.log(`sonar hub listening on http://${HOST}:${PORT}  (MCP: /mcp)`);
+  });
+  server.on('error', (e: NodeJS.ErrnoException) => {
+    if (e.code === 'EADDRINUSE') {
+      console.error(`sonar: port ${PORT} is already in use. Run "sonar port auto" to move to a free port.`);
+    } else {
+      console.error(`sonar server error: ${e.message}`);
+    }
+    try {
+      fs.unlinkSync(PID_PATH);
+    } catch {}
+    process.exit(1);
   });
   server.requestTimeout = 0; // allow long-poll holds
   return server;

@@ -55,6 +55,20 @@ def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
 
 
+def resolve_port() -> int:
+    """Current hub port — source of truth is ~/.sonar/config.json (written by the CLI),
+    falling back to menubar.json then the default. Read each call so the menu bar follows
+    `sonar port` changes without a relaunch."""
+    for p in (DATA_DIR / "config.json", CONFIG_PATH):
+        try:
+            v = int(json.loads(p.read_text()).get("port"))
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    return 7610
+
+
 # --------------------------------------------------------------------------
 class Hub:
     def __init__(self, port: int):
@@ -133,14 +147,16 @@ def write_login_plist():
 
 
 # --------------------------------------------------------------------------
-def gather_state(cfg, hub) -> dict:
+def gather_state(cfg) -> dict:
+    port = resolve_port()
+    hub = Hub(port)
     health = hub.health()
     return {
         "health": health,
         "procs": hub.get("/api/procs", []) if health else [],
         "sessions": hub.get(f"/api/sessions?recent={cfg['recent_count']}&active_secs={cfg['active_secs']}", []) if health else [],
         "repos": hub.get("/api/repos?limit=18", []) if health else [],
-        "config": {"terminal": cfg.get("terminal"), "agents": cfg.get("agents"), "port": cfg.get("port"),
+        "config": {"terminal": cfg.get("terminal"), "agents": cfg.get("agents"), "port": port,
                    "active_secs": cfg.get("active_secs"), "recent_count": cfg.get("recent_count")},
         "login": PLIST_PATH.exists(),
     }
@@ -148,8 +164,7 @@ def gather_state(cfg, hub) -> dict:
 
 # --------------------------------------------------------------------------
 def run_selftest(cfg):
-    hub = Hub(cfg["port"])
-    st = gather_state(cfg, hub)
+    st = gather_state(cfg)
     print(f"hub: {'up' if st['health'] else 'DOWN'} · ui: {UI_PATH} (exists={UI_PATH.exists()})")
     print(f"running procs: {len(st['procs'])}, sessions: {len(st['sessions'])}, repos: {len(st['repos'])}")
     for p in st["procs"]:
@@ -166,7 +181,6 @@ def run_gui(cfg):
     from WebKit import WKWebView, WKWebViewConfiguration
     from PyObjCTools import AppHelper
 
-    hub = Hub(cfg["port"])
     html = UI_PATH.read_text()
 
     class Delegate(NSObject):
@@ -245,11 +259,11 @@ def run_gui(cfg):
         @objc.python_method
         def dispatch(self, action, p):
             if action == "getState":
-                st = gather_state(cfg, hub)
+                st = gather_state(cfg)
                 self.setTitleCount(len(st["procs"]))
                 return st
             if action == "kill":
-                return hub._post("/api/sessions/kill", {"pid": int(p["pid"])})
+                return Hub(resolve_port())._post("/api/sessions/kill", {"pid": int(p["pid"])})
             if action == "startSession":
                 launch_terminal(cfg, p["cwd"], p["agent"]); return {"ok": True}
             if action == "chooseFolderStart":
@@ -279,7 +293,7 @@ def run_gui(cfg):
                 else:
                     write_login_plist()
                     subprocess.run(["launchctl", "load", "-w", str(PLIST_PATH)], capture_output=True)
-                return gather_state(cfg, hub)
+                return gather_state(cfg)
             if action == "update":
                 return self.do_update()
             if action == "quit":
