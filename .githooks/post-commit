@@ -31,13 +31,17 @@ if [ ! -f "$CL" ]; then
 fi
 grep -q '^## \[Unreleased\]' "$CL" || printf '\n## [Unreleased]\n' >> "$CL"
 
-# Dedup: a plain `git commit --amend` (same subject) shouldn't add a duplicate.
-newest=$(grep -m1 '^- ' "$CL" | sed 's/^- //')
-[ "$newest" = "$subject" ] && exit 0
+# Build the entry, dated with the commit's author date (stable across our amend).
+date=$(git log -1 --pretty=%ad --date=short)
+entry="- **$date** — $subject"
 
-# Insert "- <subject>" right after the [Unreleased] heading (newest first).
+# Dedup: a same-day `git commit --amend` (same subject) shouldn't add a duplicate.
+newest=$(grep -m1 '^- ' "$CL")
+[ "$newest" = "$entry" ] && exit 0
+
+# Insert the dated entry right after the [Unreleased] heading (newest first).
 tmp=$(mktemp) || exit 0
-awk -v e="- $subject" '{ print } /^## \[Unreleased\]/ && !d { print e; d=1 }' "$CL" > "$tmp" && mv "$tmp" "$CL"
+awk -v e="$entry" '{ print } /^## \[Unreleased\]/ && !d { print e; d=1 }' "$CL" > "$tmp" && mv "$tmp" "$CL"
 
 # Fold the changelog edit into this same commit; the amend re-fires us (guarded).
 git add "$CL"
