@@ -163,14 +163,14 @@
   .fbtn.danger:hover { color: var(--danger); }
 
   /* settings overlay */
-  .settings, .help, .docpanel {
+  .settings, .help, .docpanel, .changelog {
     position: absolute; inset: 0; background: var(--bg); z-index: 5;
     display: flex; flex-direction: column; transform: translateX(100%);
     transition: transform .22s cubic-bezier(.4,0,.2,1);
   }
   .docpanel { z-index: 6; }
-  .settings.open, .help.open, .docpanel.open { transform: none; }
-  .settings .body, .help .body, .docpanel .body { flex: 1; overflow-y: auto; padding: 6px 14px 16px; }
+  .settings.open, .help.open, .docpanel.open, .changelog.open { transform: none; }
+  .settings .body, .help .body, .docpanel .body, .changelog .body { flex: 1; overflow-y: auto; padding: 6px 14px 16px; }
   .sgroup { padding: 14px 0 4px; }
   .slabel { font-size: 11px; color: var(--dim); margin-bottom: 7px; }
   .seg { display: flex; background: var(--bg-elev); border-radius: 8px; padding: 2px; gap: 2px; }
@@ -278,6 +278,9 @@
     <div class="iconbtn" id="update" title="Update sonar (git pull)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v5h-5"/></svg>
     </div>
+    <div class="iconbtn" id="changelog" title="What's new (changelog)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>
+    </div>
     <div class="iconbtn" id="help" title="Help & commands">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="12" cy="12" r="9"/><path d="M9.6 9.2a2.4 2.4 0 1 1 3.4 2.2c-.8.4-1.3 1-1.3 1.9" stroke-linecap="round"/><circle cx="12" cy="16.6" r="0.7" fill="currentColor" stroke="none"/></svg>
     </div>
@@ -381,6 +384,15 @@
     </header>
     <div class="body" id="docBody"></div>
     <div class="docbar" id="docBar"></div>
+  </div>
+
+  <!-- changelog / what's new -->
+  <div class="changelog" id="clPanel">
+    <header>
+      <div class="iconbtn" id="clBack"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m15 18-6-6 6-6"/></svg></div>
+      <div class="brand" style="font-size:13px">What's new</div>
+    </header>
+    <div class="body" id="clBody"></div>
   </div>
 </div>
 
@@ -694,6 +706,17 @@ document.getElementById('backBtn').onclick = () => document.getElementById('sett
 document.getElementById('help').onclick = () => document.getElementById('helpPanel').classList.add('open');
 document.getElementById('helpBack').onclick = () => document.getElementById('helpPanel').classList.remove('open');
 document.getElementById('docBack').onclick = () => document.getElementById('docPanel').classList.remove('open');
+document.getElementById('changelog').onclick = async () => {
+  const panel = document.getElementById('clPanel'), body = document.getElementById('clBody');
+  body.innerHTML = `<div class="notice">Loading…</div>`;
+  panel.classList.add('open');
+  let r; try { r = await host('changelog'); } catch (e) { r = { markdown: '' }; }
+  let md = (r && r.markdown) || '';
+  const i = md.indexOf('\n## ');            // drop the file title/preamble — show the entries
+  if (i >= 0) md = md.slice(i + 1);
+  body.innerHTML = md.trim() ? `<div class="docmd">${mdToHtml(md)}</div>` : `<div class="notice">No changelog yet.</div>`;
+};
+document.getElementById('clBack').onclick = () => document.getElementById('clPanel').classList.remove('open');
 document.getElementById('update').onclick = async () => {
   const m = document.getElementById('main');
   m.innerHTML = `<div class="notice">Checking for updates…</div>`;

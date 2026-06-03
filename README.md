@@ -220,6 +220,8 @@ git config core.hooksPath .githooks
 
 Write a clear commit subject and it becomes the changelog line; edit `CHANGELOG.md` freely and roll **[Unreleased]** under a version heading at release time. The hook skips merge/rebase/cherry-pick commits and subjects prefixed `Merge`, `Revert`, `Release`, or `changelog:`.
 
+Read it any time from the menu bar — the **What's new** button (📋) in the top banner renders the changelog in plain English without leaving the app.
+
 ## Project layout
 
 ```

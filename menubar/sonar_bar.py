@@ -436,6 +436,12 @@ def run_gui(cfg):
                 proc.communicate(str(p.get("text", "")).encode()); return {"ok": True}
             if action == "openLog":
                 subprocess.Popen(["open", str(LOG_PATH)]); return {"ok": True}
+            if action == "changelog":
+                try:
+                    md = (SONAR_DIR / "CHANGELOG.md").read_text()
+                except Exception:
+                    md = ""
+                return {"markdown": md}
             if action in ("startHub", "stopHub"):
                 subprocess.Popen([node_path(cfg), "--disable-warning=ExperimentalWarning",
                                   str(SONAR_DIR / "src" / "cli.ts"), "start" if action == "startHub" else "stop"])
