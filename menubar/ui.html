@@ -128,6 +128,7 @@
   .act:hover { background: var(--bg); color: var(--text); }
   @media (prefers-color-scheme: dark) { .act:hover { background: #1c1c1e; } }
   .act.danger:hover { color: #fff; background: var(--danger); }
+  .act.armed { color: #fff; background: var(--danger); }
   .act svg { width: 14px; height: 14px; }
   .killbtn {
     flex: none; font-size: 11px; font-weight: 600; color: var(--danger);
@@ -160,13 +161,14 @@
   .fbtn.danger:hover { color: var(--danger); }
 
   /* settings overlay */
-  .settings, .help {
+  .settings, .help, .docpanel {
     position: absolute; inset: 0; background: var(--bg); z-index: 5;
     display: flex; flex-direction: column; transform: translateX(100%);
     transition: transform .22s cubic-bezier(.4,0,.2,1);
   }
-  .settings.open, .help.open { transform: none; }
-  .settings .body, .help .body { flex: 1; overflow-y: auto; padding: 6px 14px 16px; }
+  .docpanel { z-index: 6; }
+  .settings.open, .help.open, .docpanel.open { transform: none; }
+  .settings .body, .help .body, .docpanel .body { flex: 1; overflow-y: auto; padding: 6px 14px 16px; }
   .sgroup { padding: 14px 0 4px; }
   .slabel { font-size: 11px; color: var(--dim); margin-bottom: 7px; }
   .seg { display: flex; background: var(--bg-elev); border-radius: 8px; padding: 2px; gap: 2px; }
@@ -202,6 +204,34 @@
   /* update / status notice (shown in main) */
   .notice { padding: 30px 18px; text-align: center; color: var(--dim); font-size: 13px; line-height: 1.55; }
   .notice.err { color: var(--danger); }
+
+  /* links + doc viewer */
+  .badges { display: flex; gap: 3px; flex: none; }
+  .lcount {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 18px; height: 18px; padding: 0 5px; border-radius: 99px;
+    background: var(--accent); color: #fff; font-size: 10px; font-weight: 700; flex: none;
+  }
+  .linkrow { cursor: default; }
+  .docmeta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 2px 2px; color: var(--dim); font-size: 11px; }
+  .docfeed { background: var(--bg-elev); border-radius: 9px; padding: 8px 10px; margin: 9px 0 4px; }
+  .docfeed .fh { font-size: 10.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--accent); margin-bottom: 6px; }
+  .newrow { font-size: 11.5px; color: var(--text); padding: 3px 0; line-height: 1.4; }
+  .newrow .nm { color: var(--dim); font-weight: 400; }
+  .docmd { padding-top: 8px; }
+  .docmd h2.dh1 { font-size: 14px; margin: 6px 0 4px; }
+  .docmd h3.dh2 {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--faint);
+    margin: 16px 0 4px; border-top: 1px solid var(--border); padding-top: 11px;
+  }
+  .docmd p { font-size: 12px; color: var(--text); margin: 4px 0; line-height: 1.5; }
+  .docmd ul { margin: 4px 0; padding-left: 18px; }
+  .docmd li { font-size: 12px; color: var(--text); margin: 3px 0; line-height: 1.45; }
+  .docmd code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; background: var(--bg-elev); padding: 1px 5px; border-radius: 5px; }
+  .docmd .quote { font-size: 11px; color: var(--dim); border-left: 2px solid var(--border); padding: 1px 0 1px 9px; margin: 5px 0; }
+  .docmd .empty { padding: 6px 2px; }
+  .docbar { display: flex; align-items: center; gap: 7px; padding: 8px 12px; border-top: 1px solid var(--border); }
+  .docbar .fbtn { background: var(--bg-elev); }
 </style>
 </head>
 <body>
@@ -312,6 +342,16 @@
       <div class="ver" id="ver">sonar</div>
     </div>
   </div>
+
+  <!-- doc viewer -->
+  <div class="docpanel" id="docPanel">
+    <header>
+      <div class="iconbtn" id="docBack"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m15 18-6-6 6-6"/></svg></div>
+      <div class="brand" style="font-size:13px" id="docTitle">link</div>
+    </header>
+    <div class="body" id="docBody"></div>
+    <div class="docbar" id="docBar"></div>
+  </div>
 </div>
 
 <script>
@@ -333,12 +373,14 @@ const I = {
   doc:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 3v5h5"/><path d="M7 3h7l5 5v11a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/></svg>',
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h8a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/></svg>',
   copy:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg>',
+  trash:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V5h6v2M7 7l1 13h8l1-13"/></svg>',
 };
 
 // ---- state / render ----
-let STATE = { health: null, procs: [], sessions: [], repos: [], config: {}, login: false };
+let STATE = { health: null, links: [], unread_total: 0, procs: [], sessions: [], repos: [], config: {}, login: false };
 let FILTER = '';
 let showStart = false;
+let rmArmed = null, rmTimer = null;   // link id pending remove-confirm (survives re-render)
 
 function relTime(iso) {
   const s = (Date.now() - new Date(iso).getTime()) / 1000;
@@ -386,6 +428,26 @@ function render() {
   }
 
   let html = '';
+
+  // links — the cross-session collaborations (sonar's reason for existing)
+  const links = STATE.links || [];
+  html += `<div class="sectitle">Links <span class="count">${links.length}</span></div>`;
+  if (!links.length) html += `<div class="empty">No active links. Run <b>/sonar</b> in a session to start one.</div>`;
+  for (const lk of links) {
+    const ags = (lk.agents || '').split(',').map(s => s.trim()).filter(Boolean);
+    const badges = ags.length ? `<span class="badges">${ags.map(a => badge(a)).join('')}</span>` : '';
+    const when = lk.last_message_at || lk.created_at;
+    const t2 = `${esc(lk.id)} · ${lk.message_count || 0} msgs${lk.participants ? ` · ${esc(lk.participants)}` : ''}${when ? ` · ${relTime(when)}` : ''}`;
+    const unread = lk.unread ? `<span class="lcount" title="${lk.unread} unread">${lk.unread}</span>` : '';
+    html += `<div class="row linkrow" data-link="${esc(lk.id)}">
+      <span class="adot ${lk.unread ? 'on' : ''}"></span>${badges}
+      <div class="rowtext"><div class="t1">${esc(lk.title || lk.id)}</div><div class="t2">${t2}</div></div>
+      ${unread}
+      <div class="actions">
+        <div class="act" data-act="copy" data-arg="${esc(lk.id)}" title="Copy link ID">${I.copy}</div>
+        <div class="act danger ${rmArmed === lk.id ? 'armed' : ''}" data-rm="${esc(lk.id)}" title="${rmArmed === lk.id ? 'Click again to remove' : 'Remove link'}">${I.trash}</div>
+      </div></div>`;
+  }
 
   // start-session panel (toggled by footer "+ Start session"; part of render so the
   // 4s refresh doesn't wipe it)
@@ -444,6 +506,34 @@ function render() {
     };
   });
 
+  // link rows → open the in-popover doc viewer
+  m.querySelectorAll('.linkrow').forEach(row => {
+    row.onclick = (e) => {
+      if (e.target.closest('[data-act],[data-rm]')) return;
+      const id = row.dataset.link;
+      openLink((STATE.links || []).find(l => l.id === id) || { id });
+    };
+  });
+
+  // remove link (inline two-step confirm — WKWebView has no window.confirm).
+  // Armed state lives in module-scope `rmArmed` so the 4.5s re-render can't drop it.
+  m.querySelectorAll('[data-rm]').forEach(el => {
+    el.onclick = async (e) => {
+      e.stopPropagation();
+      const id = el.dataset.rm;
+      if (rmArmed !== id) {
+        rmArmed = id;
+        clearTimeout(rmTimer);
+        rmTimer = setTimeout(() => { rmArmed = null; render(); }, 2500);
+        render();
+        return;
+      }
+      clearTimeout(rmTimer); rmArmed = null;
+      await host('removeLink', { id });
+      refresh();
+    };
+  });
+
   // start-session buttons (when the panel is open)
   m.querySelectorAll('[data-start-agent]').forEach(b => b.onclick = async () => {
     const sel = m.querySelector('#repoSel').value;
@@ -453,6 +543,65 @@ function render() {
     else await host('startSession', { cwd: sel, agent });
     render();
   });
+}
+
+// ---- doc viewer (renders a link's shared context.md in the popover) ----
+// Minimal markdown → HTML for the doc's known shapes (## sections, > attributions,
+// - bullets, **bold**, `code`). Everything is escaped before inline formatting.
+function mdToHtml(src) {
+  const lines = (src || '').split('\n');
+  const out = []; let inList = false;
+  const inline = (s) => esc(s)
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>');
+  const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, '');
+    if (/^#\s+/.test(line)) { closeList(); out.push(`<h2 class="dh1">${inline(line.replace(/^#\s+/, ''))}</h2>`); }
+    else if (/^##\s+/.test(line)) { closeList(); out.push(`<h3 class="dh2">${inline(line.replace(/^##\s+/, ''))}</h3>`); }
+    else if (/^>\s?/.test(line)) { closeList(); out.push(`<div class="quote">${inline(line.replace(/^>\s?/, ''))}</div>`); }
+    else if (/^[-*]\s+/.test(line)) { if (!inList) { out.push('<ul>'); inList = true; } out.push(`<li>${inline(line.replace(/^[-*]\s+/, ''))}</li>`); }
+    else if (line.trim() === '') { closeList(); }
+    else { closeList(); out.push(`<p>${inline(line.replace(/^_|_$/g, ''))}</p>`); }
+  }
+  closeList();
+  return out.join('') || '<div class="empty">(empty doc)</div>';
+}
+
+async function openLink(lk) {
+  const panel = document.getElementById('docPanel');
+  document.getElementById('docTitle').textContent = lk.title || lk.id;
+  document.getElementById('docBody').innerHTML = `<div class="notice">Loading…</div>`;
+  document.getElementById('docBar').innerHTML = '';
+  panel.classList.add('open');
+  let r;
+  try { r = await host('linkDoc', { id: lk.id }); }
+  catch (e) { document.getElementById('docBody').innerHTML = `<div class="notice err">${esc(String(e))}</div>`; return; }
+  renderDoc(r);
+  if (r.last_seq) { await host('markSeen', { id: lk.id, seq: r.last_seq }); refresh(); }
+}
+
+function renderDoc(r) {
+  const seen = r.seen_seq || 0;
+  const fresh = (r.messages || []).filter(m => (m.seq || 0) > seen);
+  let feed = '';
+  if (fresh.length) {
+    feed = `<div class="docfeed"><div class="fh">▲ ${fresh.length} new since you last viewed</div>` +
+      fresh.slice(-12).map(m => {
+        const tag = [m.agent, m.branch].filter(Boolean).join('/');
+        const body = esc((m.body || '').replace(/\s+/g, ' ')).slice(0, 220);
+        return `<div class="newrow"><b>${esc(m.from_label)}</b>${tag ? ` <span class="nm">(${esc(tag)})</span>` : ''} <span class="nm">· ${relTime(m.created_at)}</span><br>${body}</div>`;
+      }).join('') + `</div>`;
+  }
+  const parts = (r.participants && r.participants.length)
+    ? r.participants.map(p => `${badge(p.agent)} ${esc(p.label)}`).join(' &nbsp; ')
+    : `<span>${esc(r.id)}</span>`;
+  const meta = `<div class="docmeta">${parts}</div>`;
+  document.getElementById('docBody').innerHTML = meta + feed + `<div class="docmd">${mdToHtml(r.markdown)}</div>`;
+  const bar = document.getElementById('docBar');
+  bar.innerHTML = `<div class="fbtn" id="docOpenFile">Open file</div><div class="spacer"></div><div class="fbtn" id="docCopyId">Copy ID</div>`;
+  document.getElementById('docOpenFile').onclick = () => { if (r.path) host('openPath', { path: r.path }); };
+  document.getElementById('docCopyId').onclick = () => host('copy', { text: r.id });
 }
 
 async function refresh() {
@@ -472,6 +621,7 @@ document.getElementById('gear').onclick = () => document.getElementById('setting
 document.getElementById('backBtn').onclick = () => document.getElementById('settings').classList.remove('open');
 document.getElementById('help').onclick = () => document.getElementById('helpPanel').classList.add('open');
 document.getElementById('helpBack').onclick = () => document.getElementById('helpPanel').classList.remove('open');
+document.getElementById('docBack').onclick = () => document.getElementById('docPanel').classList.remove('open');
 document.getElementById('update').onclick = async () => {
   const m = document.getElementById('main');
   m.innerHTML = `<div class="notice">Checking for updates…</div>`;

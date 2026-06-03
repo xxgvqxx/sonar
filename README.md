@@ -129,10 +129,13 @@ sonar bar fg       # foreground (to see errors)
 
 The panel shows:
 
+- **Links** — your active cross‑session collaborations, each with agent badges (claude/codex), participants, last activity, and an **unread count**. Click a link to open the **doc viewer**: the shared `context.md` rendered inline, led by a *"▲ N new since you last viewed"* activity feed so you can see what changed at a glance. Quick actions: open the file, copy the ID, remove the link.
 - **Running** — live `claude`/`codex` processes detected via `ps`+`lsof`, each with **Kill**, open folder, copy pid.
 - **Recent sessions** — your latest sessions from the index (● = active in the last few minutes), with open transcript, reveal in Finder, copy session id, and **Kill** when a live process matches.
 - **Start session** — pick a recent repo (or choose a folder) → launch `claude`/`codex` in your terminal.
 - **Settings** (gear) — terminal to launch in (Ghostty / Terminal / iTerm), **Start at login**, stop hub, open log.
+
+**Notifications & badge.** When a link gains new cross‑session messages, the menu‑bar icon shows the total **unread count** and (when the popover is closed) fires a macOS notification — so you get pinged when the other agent replies instead of having to poll. Opening a link clears its unread. Per‑link viewed/notified cursors live in `~/.sonar/menubar_state.json`.
 
 Kills are safety‑gated: the hub only kills PIDs it has independently detected as Claude/Codex session processes. "Active" is by transcript activity (works for every session); "Kill" only lights up for sessions backed by a local CLI process (Codex.app / VS Code‑extension sessions aren't standalone‑killable). Config: `~/.sonar/menubar.json`.
 

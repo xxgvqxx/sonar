@@ -6,6 +6,23 @@ import { spawnWorker } from './spawn.ts';
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
 
+// Piggyback a gentle "you have unread" nudge onto write-tool responses so a busy
+// agent that isn't parked in a wait() loop still learns the other side replied.
+function pending(linkId: string, label?: string): string {
+  if (!label) return '';
+  try {
+    const u = core.unreadFor(linkId, label);
+    if (!u.count) return '';
+    return (
+      `\n\n⚠️ ${u.count} unread message${u.count === 1 ? '' : 's'} on ${linkId}` +
+      (u.from.length ? ` from ${u.from.join(', ')}` : '') +
+      `. Call read(link_id="${linkId}", since_seq=${u.after}) or doc_read to catch up, then wait() to keep listening.`
+    );
+  } catch {
+    return '';
+  }
+}
+
 // Rebuild the doc's "Participants" section from the authoritative list (no dupes on re-join).
 function syncParticipants(linkId: string) {
   const body = core
@@ -147,7 +164,7 @@ export function registerTools(server: McpServer) {
     },
     async (a) => {
       const r = core.postMessage({ linkId: a.link_id, from: a.from, body: a.body, agent: a.agent, branch: a.branch, replyTo: a.reply_to });
-      return text(`Posted to ${a.link_id} as seq ${r.seq}. Call wait(link_id="${a.link_id}", from="${a.from}", after_seq=${r.seq}) to await a reply.`);
+      return text(`Posted to ${a.link_id} as seq ${r.seq}. Call wait(link_id="${a.link_id}", from="${a.from}", after_seq=${r.seq}) to await a reply.` + pending(a.link_id, a.from));
     }
   );
 
@@ -278,7 +295,7 @@ export function registerTools(server: McpServer) {
       if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
       docs.appendToSection(a.link_id, a.section, a.text, a.from);
       core.postMessage({ linkId: a.link_id, from: a.from, body: `📝 updated doc → ${a.section}: ${a.text.replace(/\s+/g, ' ').slice(0, 140)}` });
-      return text(`Appended to "${a.section}" and pinged the link. Doc: ${docs.docPath(a.link_id)}`);
+      return text(`Appended to "${a.section}" and pinged the link. Doc: ${docs.docPath(a.link_id)}` + pending(a.link_id, a.from));
     }
   );
 
@@ -293,7 +310,7 @@ export function registerTools(server: McpServer) {
       if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
       docs.setSection(a.link_id, a.section, a.text);
       if (a.from) core.postMessage({ linkId: a.link_id, from: a.from, body: `📝 rewrote doc section "${a.section}"` });
-      return text(`Section "${a.section}" replaced. Doc: ${docs.docPath(a.link_id)}`);
+      return text(`Section "${a.section}" replaced. Doc: ${docs.docPath(a.link_id)}` + pending(a.link_id, a.from));
     }
   );
 

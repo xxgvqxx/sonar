@@ -26,6 +26,7 @@ SONAR_DIR = MENUBAR_DIR.parent
 UI_PATH = MENUBAR_DIR / "ui.html"
 DATA_DIR = Path(os.path.expanduser(os.environ.get("SONAR_DIR", "~/.sonar")))
 CONFIG_PATH = DATA_DIR / "menubar.json"
+STATE_PATH = DATA_DIR / "menubar_state.json"   # per-link viewed/notified cursors (owned by the menu bar)
 LOG_PATH = DATA_DIR / "daemon.log"
 PLIST_PATH = Path(os.path.expanduser("~/Library/LaunchAgents/com.sonar.menubar.plist"))
 
@@ -53,6 +54,39 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+def load_state() -> dict:
+    """Menu-bar-owned cursors: how far the human has viewed (`seen`) and been
+    notified (`notified`) per link, keyed by link id → seq."""
+    st = {"seen": {}, "notified": {}}
+    try:
+        data = json.loads(STATE_PATH.read_text())
+        st["seen"].update(data.get("seen") or {})
+        st["notified"].update(data.get("notified") or {})
+    except Exception:
+        pass
+    return st
+
+
+def save_state(st: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(st, indent=2))
+
+
+def _osa_str(s) -> str:
+    """Quote a Python string as an AppleScript string literal."""
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ") + '"'
+
+
+def notify(title: str, message: str) -> None:
+    """Fire a macOS notification. Uses osascript so it works without a bundled
+    .app or notification entitlements (good enough for a local dev tool)."""
+    try:
+        script = f"display notification {_osa_str(message)} with title {_osa_str(title)}"
+        subprocess.Popen(["osascript", "-e", script])
+    except Exception:
+        pass
 
 
 def resolve_port() -> int:
@@ -83,6 +117,11 @@ class Hub:
             self.base + path, data=json.dumps(body).encode(),
             headers={"content-type": "application/json"}, method="POST",
         )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read().decode())
+
+    def _delete(self, path: str):
+        req = urllib.request.Request(self.base + path, method="DELETE")
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read().decode())
 
@@ -153,6 +192,7 @@ def gather_state(cfg) -> dict:
     health = hub.health()
     return {
         "health": health,
+        "links": hub.get("/api/links", []) if health else [],
         "procs": hub.get("/api/procs", []) if health else [],
         "sessions": hub.get(f"/api/sessions?recent={cfg['recent_count']}&active_secs={cfg['active_secs']}", []) if health else [],
         "repos": hub.get("/api/repos?limit=18", []) if health else [],
@@ -166,7 +206,9 @@ def gather_state(cfg) -> dict:
 def run_selftest(cfg):
     st = gather_state(cfg)
     print(f"hub: {'up' if st['health'] else 'DOWN'} · ui: {UI_PATH} (exists={UI_PATH.exists()})")
-    print(f"running procs: {len(st['procs'])}, sessions: {len(st['sessions'])}, repos: {len(st['repos'])}")
+    print(f"links: {len(st.get('links') or [])}, procs: {len(st['procs'])}, sessions: {len(st['sessions'])}, repos: {len(st['repos'])}")
+    for lk in st.get("links") or []:
+        print(f"  link {lk.get('id')}  {lk.get('message_count', 0)} msgs  last_seq={lk.get('last_seq')}  [{lk.get('agents') or ''}]")
     for p in st["procs"]:
         print(f"  {p['agent']:6} pid {p['pid']:>7} {p.get('cwd')}")
 
@@ -257,11 +299,79 @@ def run_gui(cfg):
             self.item.button().setTitle_(f" {n}" if n else "")
 
         @objc.python_method
+        def maybe_notify(self, links, state):
+            """Fire a macOS notification for links that gained messages since we last
+            alerted. Seeds `notified` to the current tail on first sighting so we never
+            storm the user with the whole backlog on launch."""
+            changed = False
+            for lk in links:
+                lid = lk.get("id")
+                if not lid:
+                    continue
+                last = lk.get("last_seq") or 0
+                prev = state["notified"].get(lid)
+                if prev is None:
+                    state["notified"][lid] = last
+                    changed = True
+                    continue
+                seen = state["seen"].get(lid, 0)
+                if last > prev and last > seen:
+                    n = last - prev
+                    title = lk.get("title") or lid
+                    agents = lk.get("agents") or ""
+                    body = f"{n} new message" + ("" if n == 1 else "s") + (f" · {agents}" if agents else "")
+                    notify(f"sonar · {title}", body)
+                if last != prev:
+                    state["notified"][lid] = last
+                    changed = True
+            if changed:
+                save_state(state)
+
+        @objc.python_method
         def dispatch(self, action, p):
             if action == "getState":
                 st = gather_state(cfg)
-                self.setTitleCount(len(st["procs"]))
+                state = load_state()
+                total = 0
+                for lk in st.get("links") or []:
+                    last = lk.get("last_seq") or 0
+                    seen = state["seen"].get(lk["id"], 0)
+                    lk["unread"] = max(0, last - seen)
+                    lk["seen_seq"] = seen
+                    total += lk["unread"]
+                st["unread_total"] = total
+                if self.pop.isShown():
+                    # user is looking — don't fire notifications; just seed `notified`
+                    # so closing the popover later won't re-alert for what they saw.
+                    for lk in st.get("links") or []:
+                        state["notified"][lk["id"]] = lk.get("last_seq") or 0
+                    save_state(state)
+                else:
+                    self.maybe_notify(st.get("links") or [], state)
+                self.setTitleCount(total)
                 return st
+            if action == "linkDoc":
+                hub = Hub(resolve_port()); lid = p["id"]
+                doc = hub.get(f"/api/links/{lid}/doc", {}) or {}
+                info = hub.get(f"/api/links/{lid}", {}) or {}
+                msgs = hub.get(f"/api/links/{lid}/messages?limit=300", []) or []
+                last_seq = max([m.get("seq", 0) for m in msgs], default=0)
+                state = load_state()
+                return {"id": lid, "markdown": doc.get("markdown", ""), "path": doc.get("path"),
+                        "messages": msgs, "last_seq": last_seq, "seen_seq": state["seen"].get(lid, 0),
+                        "participants": info.get("participants", []), "link": info.get("link")}
+            if action == "markSeen":
+                state = load_state(); seq = int(p.get("seq") or 0)
+                state["seen"][p["id"]] = seq; state["notified"][p["id"]] = seq
+                save_state(state); return {"ok": True}
+            if action == "removeLink":
+                try:
+                    Hub(resolve_port())._delete(f"/api/links/{p['id']}")
+                except Exception as e:
+                    return {"ok": False, "error": str(e)}
+                state = load_state()
+                state["seen"].pop(p["id"], None); state["notified"].pop(p["id"], None)
+                save_state(state); return {"ok": True}
             if action == "kill":
                 return Hub(resolve_port())._post("/api/sessions/kill", {"pid": int(p["pid"])})
             if action == "startSession":

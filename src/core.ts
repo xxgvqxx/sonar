@@ -86,7 +86,9 @@ export function listLinks(opts: { activeDays?: number } = {}) {
       `SELECT l.id, l.title, l.created_at,
               (SELECT MAX(created_at) FROM messages m WHERE m.link_id = l.id) AS last_message_at,
               (SELECT COUNT(*) FROM messages m WHERE m.link_id = l.id) AS message_count,
-              (SELECT GROUP_CONCAT(label, ', ') FROM participants p WHERE p.link_id = l.id) AS participants
+              (SELECT MAX(seq) FROM messages m WHERE m.link_id = l.id) AS last_seq,
+              (SELECT GROUP_CONCAT(label, ', ') FROM participants p WHERE p.link_id = l.id) AS participants,
+              (SELECT GROUP_CONCAT(DISTINCT agent) FROM participants p WHERE p.link_id = l.id) AS agents
        FROM links l
        ORDER BY COALESCE(last_message_at, created_at) DESC
        LIMIT 50`
@@ -207,6 +209,20 @@ export async function waitForMessages(opts: {
     }, timeoutMs);
     set.add(waiter);
   });
+}
+
+/**
+ * How many messages on `linkId` are unread for participant `label`, relative to
+ * their wait() read-cursor (which only wait() advances). Does NOT mutate the
+ * cursor. Used to piggyback a "you have N unread" nudge onto other tool responses
+ * so a busy agent that isn't sitting in a wait() loop still learns the other replied.
+ */
+export function unreadFor(linkId: string, label: string): { count: number; lastSeq: number; after: number; from: string[] } {
+  const after = cursors.get(`${linkId}:${label}`) ?? 0;
+  const rows = readMessages({ linkId, sinceSeq: after, excludeFrom: label });
+  const from = [...new Set(rows.map((r) => r.from_label as string))];
+  const lastSeq = rows.length ? Math.max(...rows.map((r) => r.seq as number)) : after;
+  return { count: rows.length, lastSeq, after, from };
 }
 
 // ---------------------------------------------------------------------------
