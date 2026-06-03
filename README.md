@@ -108,6 +108,18 @@ If the working directory is a git repo, the worker runs in an **isolated worktre
 
 **Workers don't go dark.** A spawned worker is told to post a `▶ starting` line, then **check in at every checkpoint** — a one‑line progress post + substantive doc updates after each step, a quick `wait` to pick up any redirection, and a final `✅ done` / `✖ failed`. So a long (15–20 min) task surfaces progress as it goes instead of a silent black box, and those progress posts double as a heartbeat. The hub tracks each worker's live status — **running / stalled / finished** (from its process + log heartbeat) for headless workers, **interactive** for terminal ones — exposed at `GET /api/workers` and surfaced in the menu bar (a ⚙ chip on the link, and a Workers panel in the doc viewer with Log / Files / Stop). You're **notified when a worker finishes**; "stalled" (5 min of log silence) is shown as a passive amber badge, not an alert, so a long quiet operation doesn't cry wolf.
 
+### Wake a paused agent
+
+When an agent finishes its turn and parks at the prompt, sonar can **type a new prompt straight into its live pane** — same session, same context, in place — *if the session runs inside tmux*. (macOS has no way to inject input into an arbitrary tty, and Ghostty/Terminal panes aren't addressable; tmux is the channel.) Set the terminal to **tmux** (menu bar → Settings, or `menubar.json`); workers then launch into a `sonar` tmux session and become wake‑able. Watch them with `sonar attach` (or Settings → Attach).
+
+```bash
+sonar wake k7t7 claude@worker                       # idle-gated: types a "catch up + continue" prompt
+sonar wake k7t7 claude@worker "rebase on main first" # custom prompt
+sonar wake k7t7 claude@worker --force                # inject even if it looks mid-turn
+```
+
+Or hit **Wake** on the worker row in the doc viewer. Guardrails: it only injects when the pane is **idle** (output quiescent, no running‑turn hint) unless `--force`, and a **loop cap** (5 wakes / 10 min per pane) stops two agents from ping‑ponging forever. `GET /api/panes` lists addressable panes; `POST /api/wake` does the deed.
+
 ## Pull context without a link
 
 ```
@@ -153,6 +165,8 @@ sonar port <N|auto>            change the hub port (re-registers with Claude/Cod
 
 sonar doc <id> [--open]        print / open a link's shared context doc
 sonar spawn <id> [claude|codex] <task…> [--headless]   dispatch a worker on a link
+sonar wake <id> <label> [message…] [--force]   type a prompt into a live tmux pane to make a paused agent run again
+sonar attach                   attach to the sonar tmux session to watch agent panes
 sonar search <query>           full-text search your Claude + Codex history
 sonar watch <id>               live-tail a link in your terminal
 sonar create [title]           create a link from the shell
@@ -204,7 +218,7 @@ Menu‑bar settings live in `~/.sonar/menubar.json` (terminal, agents, active wi
 
 ## Limitations
 
-- **Turn‑based agents.** Instant back‑and‑forth needs both sessions live at once; otherwise the shared doc holds everything for whenever the other side is next active. Spawned workers are the autonomous path.
+- **Turn‑based agents.** Instant back‑and‑forth needs both sessions live at once; otherwise the shared doc holds everything for whenever the other side is next active. Spawned workers are the autonomous path, and `sonar wake` (tmux) can re‑prompt a paused session in place — but only sessions launched under tmux are wake‑able; a bare Ghostty pane can't be injected into.
 - **Codex branch tagging.** Codex transcripts record `cwd` but not the git branch — branch filtering in search is exact only for Claude sessions.
 - **Indexing window.** Only the last `SONAR_INDEX_DAYS` of transcripts are indexed; the first run backfills in the background.
 - **Local only.** Binds `127.0.0.1` with no auth — don't expose the port.
@@ -233,6 +247,7 @@ sonar/
     core.ts       links, messages, long-poll waiters + read cursors
     docs.ts       shared markdown doc read/append/section
     spawn.ts      worker dispatch (git worktree + terminal/headless launch) + worker registry/status
+    tmux.ts       launch sessions in tmux + wake a paused pane (send-keys, idle-gated)
     sessions.ts   process detection (ps/lsof), session listing, safe kill
     indexer.ts    incremental transcript → FTS5 indexing
     db.ts         SQLite schema (node:sqlite)

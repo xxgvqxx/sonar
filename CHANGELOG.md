@@ -3,6 +3,7 @@
 Notable changes, newest first. Entries under **[Unreleased]** are auto-appended from commit subjects by `.githooks/post-commit` (enable in a clone with `git config core.hooksPath .githooks`); edit them freely and roll them under a version heading at release time.
 
 ## [Unreleased]
+- **2026-06-03** — Wake a paused agent by typing into its live tmux pane
 - **2026-06-03** — Date every changelog entry
 - **2026-06-03** — Menu bar: read the changelog from a What's new button in the header
 - **2026-06-03** — Add CHANGELOG.md and auto-append post-commit changelog hook

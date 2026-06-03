@@ -10,6 +10,7 @@ import * as core from './core.ts';
 import * as sessions from './sessions.ts';
 import * as docs from './docs.ts';
 import { spawnWorker, listWorktrees, pruneWorktree, listWorkers, stopWorker } from './spawn.ts';
+import { listPanes, wake } from './tmux.ts';
 import { startIndexer, reindexAll } from './indexer.ts';
 import { HOST, PORT, VERSION, PID_PATH } from './config.ts';
 
@@ -230,6 +231,29 @@ export function startServer() {
   app.post(
     '/api/workers/:id/stop',
     wrap(async (req, res) => res.json(await stopWorker(req.params.id)))
+  );
+
+  // ---- live panes (tmux) + waking a paused agent by typing into its pane ----
+  app.get(
+    '/api/panes',
+    wrap(async (req, res) => res.json(await listPanes(req.query.link_id as string | undefined)))
+  );
+
+  app.post(
+    '/api/wake',
+    wrap(async (req, res) => {
+      const b = req.body || {};
+      if (!b.link_id || !b.label) return res.status(400).json({ ok: false, error: 'link_id and label required' });
+      const r = await wake({ linkId: b.link_id, label: b.label, message: b.message, force: b.force });
+      if (r.ok) {
+        try {
+          core.postMessage({ linkId: b.link_id, from: b.from || 'sonar', body: `⏰ woke ${b.label} (typed a prompt into its live pane)` });
+        } catch {
+          /* non-fatal */
+        }
+      }
+      res.json(r);
+    })
   );
 
   app.get(

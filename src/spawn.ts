@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { spawn } from 'node:child_process';
 import { DATA_DIR, MCP_URL } from './config.ts';
 import { docPath, ensureDoc } from './docs.ts';
+import { tmuxAvailable, launchWindow, recordPane } from './tmux.ts';
 
 const pexec = promisify(execFile);
 const WORKTREES = path.join(DATA_DIR, 'worktrees');
@@ -170,14 +171,25 @@ export async function spawnWorker(opts: {
   fs.writeFileSync(launcher, `#!/bin/zsh\ncd ${q(workdir)} || exit 1\nexec ${bin} "$(cat ${q(promptFile)})"\n`);
   fs.chmodSync(launcher, 0o755);
   const terminal = opts.terminal || readTerminalPref();
-  launchTerminal(terminal, workdir, `zsh ${q(launcher)}`);
+  const launchCmd = `zsh ${q(launcher)}`;
+  const label = `${agent}@worker`;
+
+  // tmux mode: launch in a named tmux window so sonar can wake/talk to the live pane.
+  if (terminal === 'tmux' && (await tmuxAvailable())) {
+    const target = await launchWindow({ window: workerId, cwd: workdir, cmd: launchCmd });
+    recordWorker({ mode: 'tmux', pid: null, log: null, target });
+    recordPane({ id: workerId, target, link_id: opts.linkId, label, agent, cwd: workdir, kind: 'worker' });
+    return { worker_id: workerId, agent, workdir, branch, mode: 'tmux', target, label, doc: docPath(opts.linkId) };
+  }
+
+  launchTerminal(terminal, workdir, launchCmd);
   recordWorker({ mode: 'interactive', pid: null, log: null });
   return { worker_id: workerId, agent, workdir, branch, mode: 'interactive', terminal, doc: docPath(opts.linkId) };
 }
 
 /** Derive a worker's live status from its process + log heartbeat. */
 function workerStatus(meta: any): 'running' | 'stalled' | 'finished' | 'interactive' | 'unknown' {
-  if (meta.mode === 'interactive') return 'interactive';
+  if (meta.mode === 'interactive' || meta.mode === 'tmux') return 'interactive';
   if (!meta.pid) return 'unknown';
   if (!alive(meta.pid)) return 'finished';
   try {

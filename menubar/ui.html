@@ -262,6 +262,11 @@
   .wbtn { font-size: 10.5px; color: var(--dim); padding: 3px 7px; border-radius: 6px; background: var(--bg-elev); }
   .wbtn:hover { background: var(--row-hover); color: var(--text); }
   .wbtn.danger:hover { background: var(--danger); color: #fff; }
+  .wbtn.wake { color: var(--accent); }
+  .wbtn.wake:hover { background: var(--accent); color: #fff; }
+  .gobtn { font-size: 11px; font-weight: 600; color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); padding: 3px 11px; border-radius: 7px; }
+  .gobtn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .hint { font-size: 10.5px; color: var(--faint); line-height: 1.4; padding: 7px 2px 0; }
 </style>
 </head>
 <body>
@@ -358,7 +363,13 @@
           <button data-t="ghostty">Ghostty</button>
           <button data-t="terminal">Terminal</button>
           <button data-t="iterm">iTerm</button>
+          <button data-t="tmux">tmux</button>
         </div>
+        <div class="hint" id="tmuxHint">tmux lets sonar <b>wake a paused agent</b> by typing into its live pane. Watch them with Attach below.</div>
+      </div>
+      <div class="toggle-row">
+        <div>Watch agent panes (tmux)</div>
+        <div class="gobtn" id="attachTmux">Attach</div>
       </div>
       <div class="toggle-row">
         <div>Start at login</div>
@@ -634,12 +645,15 @@ async function openLink(lk) {
   if (r.last_seq) { await host('markSeen', { id: lk.id, seq: r.last_seq }); refresh(); }
 }
 
-function renderWorkers(workers) {
+function renderWorkers(workers, liveLabels) {
   if (!workers || !workers.length) return '';
+  liveLabels = liveLabels || new Set();
   const rows = workers.map(w => {
     const st = w.status || 'unknown';
     const when = w.started_at ? relTime(w.started_at) : '';
+    const label = `${w.agent || 'claude'}@worker`;
     const acts = [];
+    if (liveLabels.has(label)) acts.push(`<div class="wbtn wake" data-wlink="${esc(w.link_id)}" data-wlabel="${esc(label)}" title="Type a prompt into its live pane">Wake</div>`);
     if (w.log) acts.push(`<div class="wbtn" data-wlog="${esc(w.log)}">Log</div>`);
     if (w.workdir) acts.push(`<div class="wbtn" data-wreveal="${esc(w.workdir)}">Files</div>`);
     if (st === 'running' || st === 'stalled') acts.push(`<div class="wbtn danger" data-wstop="${esc(w.id)}">Stop</div>`);
@@ -668,8 +682,9 @@ function renderDoc(r) {
     ? r.participants.map(p => `${badge(p.agent)} ${esc(p.label)}`).join(' &nbsp; ')
     : `<span>${esc(r.id)}</span>`;
   const meta = `<div class="docmeta">${parts}</div>`;
+  const liveLabels = new Set((r.panes || []).filter(p => p && p.alive && p.label).map(p => p.label));
   const body = document.getElementById('docBody');
-  body.innerHTML = meta + renderWorkers(r.workers) + feed + `<div class="docmd">${mdToHtml(r.markdown)}</div>`;
+  body.innerHTML = meta + renderWorkers(r.workers, liveLabels) + feed + `<div class="docmd">${mdToHtml(r.markdown)}</div>`;
   const bar = document.getElementById('docBar');
   bar.innerHTML = `<div class="fbtn" id="docOpenFile">Open file</div><div class="spacer"></div><div class="fbtn" id="docCopyId">Copy ID</div>`;
   document.getElementById('docOpenFile').onclick = () => { if (r.path) host('openPath', { path: r.path }); };
@@ -678,6 +693,16 @@ function renderDoc(r) {
   // worker actions
   body.querySelectorAll('[data-wlog]').forEach(el => el.onclick = () => host('openPath', { path: el.dataset.wlog }));
   body.querySelectorAll('[data-wreveal]').forEach(el => el.onclick = () => host('reveal', { path: el.dataset.wreveal }));
+  body.querySelectorAll('[data-wlink]').forEach(el => {
+    el.onclick = async () => {
+      const orig = el.textContent;
+      el.textContent = 'Waking…';
+      let res; try { res = await host('wake', { link_id: el.dataset.wlink, label: el.dataset.wlabel }); } catch (e) { res = { ok: false, error: String(e) }; }
+      el.textContent = res.ok ? 'Woke ✓' : (res.busy ? 'Busy' : 'Failed');
+      el.title = res.ok ? (res.message || '') : (res.error || '');
+      setTimeout(() => { if (el.isConnected) { el.textContent = orig; el.title = 'Type a prompt into its live pane'; } }, 2800);
+    };
+  });
   body.querySelectorAll('[data-wstop]').forEach(el => {
     let armed = false;
     el.onclick = async () => {
@@ -735,6 +760,7 @@ document.getElementById('termSeg').onclick = async (e) => {
 };
 document.getElementById('loginSwitch').onclick = async () => { STATE = await host('toggleLogin'); syncSettings(); };
 document.getElementById('stopHub').onclick = async () => { await host('stopHub'); setTimeout(refresh, 800); };
+document.getElementById('attachTmux').onclick = () => host('attachTmux');
 document.getElementById('quitBtn').onclick = () => host('quit');
 document.getElementById('openLog').onclick = () => host('openLog');
 document.getElementById('newSession').onclick = () => { showStart = !showStart; render(); };

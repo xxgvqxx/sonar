@@ -508,6 +508,31 @@ async function cmdSpawn(args: string[]) {
   console.log(`  doc:     ${r.doc}`);
 }
 
+async function cmdWake(args: string[]) {
+  await ensureUp();
+  const force = args.includes('--force');
+  const rest = args.filter((x) => x !== '--force');
+  const id = rest.shift();
+  const label = rest.shift();
+  if (!id || !label) throw new Error('usage: sonar wake <link> <label> [message…] [--force]\n  (label is the agent\'s handle, e.g. claude@worker)');
+  const message = rest.join(' ') || undefined;
+  const r = await api('POST', '/api/wake', { link_id: id, label, message, force });
+  if (r.ok) {
+    console.log(`woke ${label} → typed into ${r.target}`);
+    console.log(`  prompt: ${r.message}`);
+  } else {
+    console.error(`could not wake ${label}: ${r.error}`);
+    if (r.busy) console.error('  (re-run with --force to inject anyway)');
+    process.exitCode = 1;
+  }
+}
+
+function cmdAttach() {
+  // Open the sonar tmux session in this terminal so you can watch the agent panes.
+  const child = spawn('tmux', ['attach', '-t', 'sonar'], { stdio: 'inherit' });
+  child.on('exit', (c) => process.exit(c ?? 0));
+}
+
 function cmdBar(args: string[]) {
   const menubarDir = path.join(path.dirname(SELF), '..', 'menubar');
   const uv = 'uv';
@@ -545,6 +570,8 @@ Terminal helpers (talk to the running hub):
   sonar search <query>
   sonar doc <id> [--open]              print (or open) the shared context doc
   sonar spawn <id> [claude|codex] <task…> [--headless]   dispatch a worker session on a link
+  sonar wake <id> <label> [message…] [--force]   type a prompt into a live tmux pane to make a paused agent run again
+  sonar attach                         attach to the sonar tmux session to watch agent panes
   sonar rm <id>                        delete a link and its doc
   sonar reindex                        rebuild the transcript search index
   sonar worktrees [prune <name|--all>] list / clean up worker git worktrees
@@ -585,6 +612,10 @@ const run = async () => {
       return cmdDoc(rest);
     case 'spawn':
       return cmdSpawn(rest);
+    case 'wake':
+      return cmdWake(rest);
+    case 'attach':
+      return cmdAttach();
     case 'rm':
       return cmdRm(rest);
     case 'reindex':

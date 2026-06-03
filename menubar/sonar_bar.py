@@ -144,7 +144,15 @@ def launch_terminal(cfg: dict, directory: str, cmd: str):
     shell = cfg.get("shell", "zsh")
     term = cfg.get("terminal", "ghostty")
     keepalive = f"{cmd}; exec {shell}"
-    if term == "ghostty":
+    if term == "tmux":
+        # Launch into a window under the shared `sonar` tmux session so sonar can
+        # wake/talk to the live pane, then open Ghostty attached so you can watch.
+        name = os.path.basename(directory.rstrip("/")) or "agent"
+        has = subprocess.run(["tmux", "has-session", "-t", "sonar"], capture_output=True).returncode == 0
+        sub = ["new-window", "-t", "sonar"] if has else ["new-session", "-d", "-s", "sonar"]
+        subprocess.run(["tmux", *sub, "-n", name, "-c", directory, keepalive])
+        subprocess.Popen(["open", "-na", "Ghostty", "--args", "-e", shell, "-lc", "tmux attach -t sonar"])
+    elif term == "ghostty":
         subprocess.Popen(["open", "-na", "Ghostty", "--args", f"--working-directory={directory}", "-e", shell, "-lc", keepalive])
     elif term == "iterm":
         script = ('tell application "iTerm2"\n create window with default profile\n'
@@ -396,16 +404,26 @@ def run_gui(cfg):
                 info = hub.get(f"/api/links/{lid}", {}) or {}
                 msgs = hub.get(f"/api/links/{lid}/messages?limit=300", []) or []
                 wks = hub.get(f"/api/workers?link_id={lid}", []) or []
+                panes = hub.get(f"/api/panes?link_id={lid}", []) or []
                 last_seq = max([m.get("seq", 0) for m in msgs], default=0)
                 state = load_state()
                 return {"id": lid, "markdown": doc.get("markdown", ""), "path": doc.get("path"),
-                        "messages": msgs, "workers": wks, "last_seq": last_seq, "seen_seq": state["seen"].get(lid, 0),
+                        "messages": msgs, "workers": wks, "panes": panes, "last_seq": last_seq, "seen_seq": state["seen"].get(lid, 0),
                         "participants": info.get("participants", []), "link": info.get("link")}
             if action == "stopWorker":
                 try:
                     return Hub(resolve_port())._post(f"/api/workers/{p['id']}/stop", {})
                 except Exception as e:
                     return {"ok": False, "error": str(e)}
+            if action == "wake":
+                try:
+                    return Hub(resolve_port())._post("/api/wake", {"link_id": p["link_id"], "label": p["label"], "message": p.get("message"), "force": p.get("force"), "from": "menu-bar"})
+                except Exception as e:
+                    return {"ok": False, "error": str(e)}
+            if action == "attachTmux":
+                shell = cfg.get("shell", "zsh")
+                subprocess.Popen(["open", "-na", "Ghostty", "--args", "-e", shell, "-lc", "tmux attach -t sonar"])
+                return {"ok": True}
             if action == "markSeen":
                 state = load_state(); seq = int(p.get("seq") or 0)
                 state["seen"][p["id"]] = seq; state["notified"][p["id"]] = seq
