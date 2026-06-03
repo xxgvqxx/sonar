@@ -59,11 +59,12 @@ def save_config(cfg: dict) -> None:
 def load_state() -> dict:
     """Menu-bar-owned cursors: how far the human has viewed (`seen`) and been
     notified (`notified`) per link, keyed by link id → seq."""
-    st = {"seen": {}, "notified": {}}
+    st = {"seen": {}, "notified": {}, "workers": {}}
     try:
         data = json.loads(STATE_PATH.read_text())
         st["seen"].update(data.get("seen") or {})
         st["notified"].update(data.get("notified") or {})
+        st["workers"].update(data.get("workers") or {})
     except Exception:
         pass
     return st
@@ -193,6 +194,7 @@ def gather_state(cfg) -> dict:
     return {
         "health": health,
         "links": hub.get("/api/links", []) if health else [],
+        "workers": hub.get("/api/workers", []) if health else [],
         "procs": hub.get("/api/procs", []) if health else [],
         "sessions": hub.get(f"/api/sessions?recent={cfg['recent_count']}&active_secs={cfg['active_secs']}", []) if health else [],
         "repos": hub.get("/api/repos?limit=18", []) if health else [],
@@ -206,9 +208,11 @@ def gather_state(cfg) -> dict:
 def run_selftest(cfg):
     st = gather_state(cfg)
     print(f"hub: {'up' if st['health'] else 'DOWN'} · ui: {UI_PATH} (exists={UI_PATH.exists()})")
-    print(f"links: {len(st.get('links') or [])}, procs: {len(st['procs'])}, sessions: {len(st['sessions'])}, repos: {len(st['repos'])}")
+    print(f"links: {len(st.get('links') or [])}, workers: {len(st.get('workers') or [])}, procs: {len(st['procs'])}, sessions: {len(st['sessions'])}, repos: {len(st['repos'])}")
     for lk in st.get("links") or []:
         print(f"  link {lk.get('id')}  {lk.get('message_count', 0)} msgs  last_seq={lk.get('last_seq')}  [{lk.get('agents') or ''}]")
+    for w in st.get("workers") or []:
+        print(f"  worker {w.get('id')}  [{w.get('status')}]  {w.get('agent')}  {w.get('task', '')[:48]}")
     for p in st["procs"]:
         print(f"  {p['agent']:6} pid {p['pid']:>7} {p.get('cwd')}")
 
@@ -328,6 +332,38 @@ def run_gui(cfg):
                 save_state(state)
 
         @objc.python_method
+        def maybe_notify_workers(self, workers, state):
+            """Notify when a worker FINISHES (definitive — its process exited).
+            Deliberately does NOT alert on 'stalled': that's a soft log-quiet
+            heuristic prone to false positives during long quiet operations, so it
+            stays a passive badge in the UI. Seeds on first sighting to avoid
+            alerting for workers that were already done before the menu bar started."""
+            changed = False
+            seen_ids = set()
+            for w in workers:
+                wid = w.get("id")
+                if not wid:
+                    continue
+                seen_ids.add(wid)
+                status = w.get("status")
+                prev = state["workers"].get(wid)
+                if prev is None:
+                    state["workers"][wid] = status
+                    changed = True
+                    continue
+                if status != prev:
+                    if status == "finished":
+                        notify("sonar · worker done", f"{w.get('agent', 'worker')} worker on {w.get('link_id')} finished")
+                    state["workers"][wid] = status
+                    changed = True
+            # forget cursors for workers that have aged out of the list
+            for wid in [k for k in state["workers"] if k not in seen_ids]:
+                del state["workers"][wid]
+                changed = True
+            if changed:
+                save_state(state)
+
+        @objc.python_method
         def dispatch(self, action, p):
             if action == "getState":
                 st = gather_state(cfg)
@@ -340,14 +376,18 @@ def run_gui(cfg):
                     lk["seen_seq"] = seen
                     total += lk["unread"]
                 st["unread_total"] = total
+                workers = st.get("workers") or []
                 if self.pop.isShown():
-                    # user is looking — don't fire notifications; just seed `notified`
+                    # user is looking — don't fire notifications; just seed cursors
                     # so closing the popover later won't re-alert for what they saw.
                     for lk in st.get("links") or []:
                         state["notified"][lk["id"]] = lk.get("last_seq") or 0
+                    for w in workers:
+                        state["workers"][w["id"]] = w.get("status")
                     save_state(state)
                 else:
                     self.maybe_notify(st.get("links") or [], state)
+                    self.maybe_notify_workers(workers, state)
                 self.setTitleCount(total)
                 return st
             if action == "linkDoc":
@@ -355,11 +395,17 @@ def run_gui(cfg):
                 doc = hub.get(f"/api/links/{lid}/doc", {}) or {}
                 info = hub.get(f"/api/links/{lid}", {}) or {}
                 msgs = hub.get(f"/api/links/{lid}/messages?limit=300", []) or []
+                wks = hub.get(f"/api/workers?link_id={lid}", []) or []
                 last_seq = max([m.get("seq", 0) for m in msgs], default=0)
                 state = load_state()
                 return {"id": lid, "markdown": doc.get("markdown", ""), "path": doc.get("path"),
-                        "messages": msgs, "last_seq": last_seq, "seen_seq": state["seen"].get(lid, 0),
+                        "messages": msgs, "workers": wks, "last_seq": last_seq, "seen_seq": state["seen"].get(lid, 0),
                         "participants": info.get("participants", []), "link": info.get("link")}
+            if action == "stopWorker":
+                try:
+                    return Hub(resolve_port())._post(f"/api/workers/{p['id']}/stop", {})
+                except Exception as e:
+                    return {"ok": False, "error": str(e)}
             if action == "markSeen":
                 state = load_state(); seq = int(p.get("seq") or 0)
                 state["seen"][p["id"]] = seq; state["notified"][p["id"]] = seq

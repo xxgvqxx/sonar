@@ -15,6 +15,7 @@
     --border: rgba(0,0,0,.07);
     --accent: #007aff;
     --danger: #ff3b30;
+    --warn: #ff9500;
     --green: #2bbf4e;
     --claude: #c2603c;
     --codex: #10a37f;
@@ -31,6 +32,7 @@
       --border: rgba(255,255,255,.09);
       --accent: #0a84ff;
       --danger: #ff453a;
+      --warn: #ff9f0a;
       --green: #32d74b;
       --claude: #e08a63;
       --codex: #1abf97;
@@ -232,6 +234,34 @@
   .docmd .empty { padding: 6px 2px; }
   .docbar { display: flex; align-items: center; gap: 7px; padding: 8px 12px; border-top: 1px solid var(--border); }
   .docbar .fbtn { background: var(--bg-elev); }
+
+  /* workers */
+  .wchip {
+    display: inline-flex; align-items: center; gap: 3px; flex: none;
+    font-size: 10px; font-weight: 600; color: var(--dim);
+    padding: 2px 6px; border-radius: 99px; background: var(--bg-elev);
+  }
+  .wchip svg { width: 11px; height: 11px; }
+  .wchip.live { color: var(--green); }
+  .wchip.stall { color: var(--warn); }
+  .wsec { margin: 9px 0 2px; }
+  .wrow { display: flex; align-items: center; gap: 8px; padding: 6px 2px; border-top: 1px solid var(--border); }
+  .wrow:first-of-type { border-top: none; }
+  .sbadge {
+    flex: none; font-size: 9.5px; font-weight: 700; letter-spacing: .02em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 5px; color: #fff;
+  }
+  .sbadge.running { background: var(--green); }
+  .sbadge.stalled { background: var(--warn); }
+  .sbadge.finished { background: var(--faint); }
+  .sbadge.interactive { background: var(--accent); }
+  .sbadge.unknown { background: var(--faint); }
+  .wtask { flex: 1; min-width: 0; font-size: 11.5px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wmeta { font-size: 10.5px; color: var(--dim); }
+  .wact { display: flex; gap: 4px; flex: none; }
+  .wbtn { font-size: 10.5px; color: var(--dim); padding: 3px 7px; border-radius: 6px; background: var(--bg-elev); }
+  .wbtn:hover { background: var(--row-hover); color: var(--text); }
+  .wbtn.danger:hover { background: var(--danger); color: #fff; }
 </style>
 </head>
 <body>
@@ -374,10 +404,14 @@ const I = {
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h8a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/></svg>',
   copy:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg>',
   trash:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V5h6v2M7 7l1 13h8l1-13"/></svg>',
+  cog:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>',
 };
 
+// group workers by their link id (built each render from STATE.workers)
+function workersForLink(id) { return (STATE.workers || []).filter(w => w.link_id === id); }
+
 // ---- state / render ----
-let STATE = { health: null, links: [], unread_total: 0, procs: [], sessions: [], repos: [], config: {}, login: false };
+let STATE = { health: null, links: [], workers: [], unread_total: 0, procs: [], sessions: [], repos: [], config: {}, login: false };
 let FILTER = '';
 let showStart = false;
 let rmArmed = null, rmTimer = null;   // link id pending remove-confirm (survives re-render)
@@ -439,10 +473,17 @@ function render() {
     const when = lk.last_message_at || lk.created_at;
     const t2 = `${esc(lk.id)} · ${lk.message_count || 0} msgs${lk.participants ? ` · ${esc(lk.participants)}` : ''}${when ? ` · ${relTime(when)}` : ''}`;
     const unread = lk.unread ? `<span class="lcount" title="${lk.unread} unread">${lk.unread}</span>` : '';
+    const wks = workersForLink(lk.id);
+    const wlive = wks.filter(w => w.status === 'running' || w.status === 'interactive').length;
+    const wstall = wks.some(w => w.status === 'stalled');
+    const wactive = wks.filter(w => w.status !== 'finished').length;
+    const wchip = wactive
+      ? `<span class="wchip ${wstall ? 'stall' : (wlive ? 'live' : '')}" title="${wactive} worker(s) active">${I.cog}${wactive}</span>`
+      : '';
     html += `<div class="row linkrow" data-link="${esc(lk.id)}">
       <span class="adot ${lk.unread ? 'on' : ''}"></span>${badges}
       <div class="rowtext"><div class="t1">${esc(lk.title || lk.id)}</div><div class="t2">${t2}</div></div>
-      ${unread}
+      ${wchip}${unread}
       <div class="actions">
         <div class="act" data-act="copy" data-arg="${esc(lk.id)}" title="Copy link ID">${I.copy}</div>
         <div class="act danger ${rmArmed === lk.id ? 'armed' : ''}" data-rm="${esc(lk.id)}" title="${rmArmed === lk.id ? 'Click again to remove' : 'Remove link'}">${I.trash}</div>
@@ -581,6 +622,24 @@ async function openLink(lk) {
   if (r.last_seq) { await host('markSeen', { id: lk.id, seq: r.last_seq }); refresh(); }
 }
 
+function renderWorkers(workers) {
+  if (!workers || !workers.length) return '';
+  const rows = workers.map(w => {
+    const st = w.status || 'unknown';
+    const when = w.started_at ? relTime(w.started_at) : '';
+    const acts = [];
+    if (w.log) acts.push(`<div class="wbtn" data-wlog="${esc(w.log)}">Log</div>`);
+    if (w.workdir) acts.push(`<div class="wbtn" data-wreveal="${esc(w.workdir)}">Files</div>`);
+    if (st === 'running' || st === 'stalled') acts.push(`<div class="wbtn danger" data-wstop="${esc(w.id)}">Stop</div>`);
+    return `<div class="wrow">
+      <span class="sbadge ${esc(st)}">${esc(st)}</span>
+      <div class="rowtext"><div class="t1">${esc(w.task || '(worker)')}</div>
+        <div class="t2">${badge(w.agent)} ${esc(w.agent || '?')}@worker${when ? ` · ${when}` : ''}${w.branch ? ` · ${esc(w.branch)}` : ''}</div></div>
+      <div class="wact">${acts.join('')}</div></div>`;
+  }).join('');
+  return `<div class="wsec docfeed"><div class="fh">Workers · ${workers.length}</div>${rows}</div>`;
+}
+
 function renderDoc(r) {
   const seen = r.seen_seq || 0;
   const fresh = (r.messages || []).filter(m => (m.seq || 0) > seen);
@@ -597,11 +656,24 @@ function renderDoc(r) {
     ? r.participants.map(p => `${badge(p.agent)} ${esc(p.label)}`).join(' &nbsp; ')
     : `<span>${esc(r.id)}</span>`;
   const meta = `<div class="docmeta">${parts}</div>`;
-  document.getElementById('docBody').innerHTML = meta + feed + `<div class="docmd">${mdToHtml(r.markdown)}</div>`;
+  const body = document.getElementById('docBody');
+  body.innerHTML = meta + renderWorkers(r.workers) + feed + `<div class="docmd">${mdToHtml(r.markdown)}</div>`;
   const bar = document.getElementById('docBar');
   bar.innerHTML = `<div class="fbtn" id="docOpenFile">Open file</div><div class="spacer"></div><div class="fbtn" id="docCopyId">Copy ID</div>`;
   document.getElementById('docOpenFile').onclick = () => { if (r.path) host('openPath', { path: r.path }); };
   document.getElementById('docCopyId').onclick = () => host('copy', { text: r.id });
+
+  // worker actions
+  body.querySelectorAll('[data-wlog]').forEach(el => el.onclick = () => host('openPath', { path: el.dataset.wlog }));
+  body.querySelectorAll('[data-wreveal]').forEach(el => el.onclick = () => host('reveal', { path: el.dataset.wreveal }));
+  body.querySelectorAll('[data-wstop]').forEach(el => {
+    let armed = false;
+    el.onclick = async () => {
+      if (!armed) { armed = true; el.textContent = 'Sure?'; setTimeout(() => { if (el.isConnected) { armed = false; el.textContent = 'Stop'; } }, 2500); return; }
+      await host('stopWorker', { id: el.dataset.wstop });
+      openLink({ id: r.id, title: r.link && r.link.title });  // reload the doc view with fresh status
+    };
+  });
 }
 
 async function refresh() {

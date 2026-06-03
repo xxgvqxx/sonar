@@ -9,6 +9,21 @@ import { docPath, ensureDoc } from './docs.ts';
 
 const pexec = promisify(execFile);
 const WORKTREES = path.join(DATA_DIR, 'worktrees');
+const WORKERS = path.join(DATA_DIR, 'workers');
+/** A headless worker whose log hasn't been written to in this long is treated as stalled.
+ *  Generous (5 min) so a long quiet operation — a big test run, a slow build — that
+ *  writes no stdout isn't mislabelled stalled. It's a soft glance-signal, not an alert. */
+const STALL_MS = 300_000;
+
+/** Is a pid still alive? (signal 0 = existence check; EPERM still means alive.) */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
 
 function readTerminalPref(): string {
   try {
@@ -41,13 +56,14 @@ function workerPrompt(opts: { linkId: string; agent: string; task: string; cwd: 
     `PROTOCOL — follow this exactly:`,
     `1. Call link_join (link_id="${opts.linkId}", label="${opts.agent}@worker", agent="${opts.agent}", cwd="${opts.cwd}"${opts.branch ? `, branch="${opts.branch}"` : ''}).`,
     `2. Call doc_read (link_id="${opts.linkId}") to load shared context and any Open questions.`,
-    `3. Work the task. The shared doc is the source of truth — keep it updated as you go:`,
-    `   • Add findings/answers with doc_append (link_id, section="Answers" or "Context" or "Decisions", text=..., from="${opts.agent}@worker").`,
-    `   • If you are blocked and need input from the other agent or the human, add a question with doc_append (section="Open questions", ...) and call post(...) with a one-line ping.`,
-    `4. Periodically call wait(link_id="${opts.linkId}", from="${opts.agent}@worker", timeout_ms=30000) to receive replies; re-read the doc when pinged. Loop a few times if you are waiting on an answer.`,
-    `5. When finished, write a short summary to the doc (section "Decisions" or "Answers") and post a final "done" message.`,
+    `3. Immediately post(link_id="${opts.linkId}", from="${opts.agent}@worker", body="▶ starting: <one-line plan>") so the human and other agents know you're alive and what you're about to do.`,
+    `4. Work the task in CHECKPOINTS. This may run for many minutes — do NOT go silent for long stretches:`,
+    `   • After each meaningful step (and at least every few minutes on long work), post(...) a one-line progress update, and append substantive findings to the doc with doc_append (section="Answers"/"Context"/"Decisions", from="${opts.agent}@worker").`,
+    `   • At each checkpoint also do a quick wait(link_id="${opts.linkId}", from="${opts.agent}@worker", timeout_ms=2000) (or read) to pick up any new instructions or redirection from the other agent / human, and re-read the doc if pinged. Don't run 15+ minutes without checking in.`,
+    `5. If you get blocked, add the question with doc_append (section="Open questions", ...), post(...) a one-line ping, then wait() in a loop for the answer.`,
+    `6. When finished, append a short summary to the doc (section "Decisions"/"Answers") and post a final "✅ done: <summary>". If you fail or give up, post "✖ failed: <reason>" so watchers aren't left hanging.`,
     ``,
-    `Always treat the shared doc as how the human follows along — write clearly into it rather than only in your terminal.`,
+    `Treat the shared doc as how the human follows along, and treat your progress posts as a heartbeat — a silent worker looks dead. Write clearly into the doc rather than only in your terminal.`,
   ].join('\n');
 }
 
@@ -100,9 +116,10 @@ export async function spawnWorker(opts: {
     }
   }
 
-  // Keep control files OUT of the user's repo: store prompt/launcher/log under ~/.sonar
+  // Keep control files OUT of the user's repo: store prompt/launcher/log/meta under ~/.sonar
   // (when workdir is an isolated worktree this also keeps it clean).
-  const ctrlDir = path.join(DATA_DIR, 'workers', `${opts.linkId}-${suffix}`);
+  const workerId = `${opts.linkId}-${suffix}`;
+  const ctrlDir = path.join(WORKERS, workerId);
   fs.mkdirSync(ctrlDir, { recursive: true });
   const prompt = workerPrompt({ linkId: opts.linkId, agent, task: opts.task, cwd: workdir, branch });
   const promptFile = path.join(ctrlDir, 'prompt.txt');
@@ -111,8 +128,27 @@ export async function spawnWorker(opts: {
   const bin = agent === 'codex' ? 'codex' : 'claude';
 
   if (opts.dryRun) {
-    return { agent, workdir, branch, mode: 'dry-run', doc: docPath(opts.linkId), promptFile };
+    return { worker_id: workerId, agent, workdir, branch, mode: 'dry-run', doc: docPath(opts.linkId), promptFile };
   }
+
+  // Persist a worker record so the hub/menu bar can list it and report status.
+  const recordWorker = (extra: Record<string, unknown>) => {
+    const meta = {
+      id: workerId,
+      link_id: opts.linkId,
+      agent,
+      task: opts.task.slice(0, 280),
+      workdir,
+      branch: branch ?? null,
+      started_at: new Date().toISOString(),
+      ...extra,
+    };
+    try {
+      fs.writeFileSync(path.join(ctrlDir, 'meta.json'), JSON.stringify(meta, null, 2));
+    } catch {
+      /* non-fatal: worker still runs, just won't show status */
+    }
+  };
 
   if (opts.headless) {
     const logFile = path.join(ctrlDir, 'worker.log');
@@ -124,7 +160,8 @@ export async function spawnWorker(opts: {
         : ['-p', prompt, '--permission-mode', 'bypassPermissions'];
     const child = spawn(bin, args, { cwd: workdir, detached: true, stdio: ['ignore', out, out] });
     child.unref();
-    return { agent, workdir, branch, mode: 'headless', pid: child.pid, log: logFile, doc: docPath(opts.linkId) };
+    recordWorker({ mode: 'headless', pid: child.pid ?? null, log: logFile });
+    return { worker_id: workerId, agent, workdir, branch, mode: 'headless', pid: child.pid, log: logFile, doc: docPath(opts.linkId) };
   }
 
   // interactive: launch via a script file so no prompt text/quotes leak into the
@@ -134,7 +171,67 @@ export async function spawnWorker(opts: {
   fs.chmodSync(launcher, 0o755);
   const terminal = opts.terminal || readTerminalPref();
   launchTerminal(terminal, workdir, `zsh ${q(launcher)}`);
-  return { agent, workdir, branch, mode: 'interactive', terminal, doc: docPath(opts.linkId) };
+  recordWorker({ mode: 'interactive', pid: null, log: null });
+  return { worker_id: workerId, agent, workdir, branch, mode: 'interactive', terminal, doc: docPath(opts.linkId) };
+}
+
+/** Derive a worker's live status from its process + log heartbeat. */
+function workerStatus(meta: any): 'running' | 'stalled' | 'finished' | 'interactive' | 'unknown' {
+  if (meta.mode === 'interactive') return 'interactive';
+  if (!meta.pid) return 'unknown';
+  if (!alive(meta.pid)) return 'finished';
+  try {
+    const age = Date.now() - fs.statSync(meta.log).mtimeMs;
+    return age > STALL_MS ? 'stalled' : 'running';
+  } catch {
+    return 'running';
+  }
+}
+
+/** List worker records (optionally for one link), each enriched with live status.
+ *  Old finished workers are dropped so the list doesn't grow without bound. */
+export async function listWorkers(linkId?: string) {
+  let dirs: string[] = [];
+  try {
+    dirs = fs.readdirSync(WORKERS);
+  } catch {
+    return [];
+  }
+  const cutoff = Date.now() - 3 * 86_400_000;
+  const out: any[] = [];
+  for (const d of dirs) {
+    let meta: any;
+    try {
+      meta = JSON.parse(fs.readFileSync(path.join(WORKERS, d, 'meta.json'), 'utf8'));
+    } catch {
+      continue; // no meta yet (or a dry-run dir) — skip
+    }
+    if (linkId && meta.link_id !== linkId) continue;
+    const status = workerStatus(meta);
+    const started = Date.parse(meta.started_at || '') || 0;
+    if (status === 'finished' && started && started < cutoff) continue;
+    out.push({ ...meta, status });
+  }
+  out.sort((a, b) => String(b.started_at || '').localeCompare(String(a.started_at || '')));
+  return out;
+}
+
+/** Stop a running headless worker (SIGTERM its process). */
+export async function stopWorker(id: string) {
+  let meta: any;
+  try {
+    meta = JSON.parse(fs.readFileSync(path.join(WORKERS, id, 'meta.json'), 'utf8'));
+  } catch {
+    return { ok: false, error: 'no such worker' };
+  }
+  if (meta.mode !== 'headless' || !meta.pid) return { ok: false, error: 'not a headless worker (no tracked process)' };
+  if (!alive(meta.pid)) return { ok: false, error: 'worker already exited' };
+  try {
+    process.kill(meta.pid, 'SIGTERM');
+    return { ok: true, stopped: meta.pid };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
 }
 
 export async function listWorktrees(): Promise<string[]> {

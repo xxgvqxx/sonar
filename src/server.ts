@@ -9,7 +9,7 @@ import { registerTools } from './tools.ts';
 import * as core from './core.ts';
 import * as sessions from './sessions.ts';
 import * as docs from './docs.ts';
-import { spawnWorker, listWorktrees, pruneWorktree } from './spawn.ts';
+import { spawnWorker, listWorktrees, pruneWorktree, listWorkers, stopWorker } from './spawn.ts';
 import { startIndexer, reindexAll } from './indexer.ts';
 import { HOST, PORT, VERSION, PID_PATH } from './config.ts';
 
@@ -220,6 +220,16 @@ export function startServer() {
       reindexAll();
       res.json({ ok: true, ...core.stats() });
     })
+  );
+
+  app.get(
+    '/api/workers',
+    wrap(async (req, res) => res.json(await listWorkers(req.query.link_id as string | undefined)))
+  );
+
+  app.post(
+    '/api/workers/:id/stop',
+    wrap(async (req, res) => res.json(await stopWorker(req.params.id)))
   );
 
   app.get(

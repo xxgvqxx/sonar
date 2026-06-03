@@ -106,6 +106,8 @@ or from inside a session: `spawn_worker(link_id, task="…")`.
 
 If the working directory is a git repo, the worker runs in an **isolated worktree** on a temp branch (`sonar/<id>-xxxx`) so its edits stay separate. Clean up finished worktrees with `sonar worktrees prune --all`.
 
+**Workers don't go dark.** A spawned worker is told to post a `▶ starting` line, then **check in at every checkpoint** — a one‑line progress post + substantive doc updates after each step, a quick `wait` to pick up any redirection, and a final `✅ done` / `✖ failed`. So a long (15–20 min) task surfaces progress as it goes instead of a silent black box, and those progress posts double as a heartbeat. The hub tracks each worker's live status — **running / stalled / finished** (from its process + log heartbeat) for headless workers, **interactive** for terminal ones — exposed at `GET /api/workers` and surfaced in the menu bar (a ⚙ chip on the link, and a Workers panel in the doc viewer with Log / Files / Stop). You're **notified when a worker finishes**; "stalled" (5 min of log silence) is shown as a passive amber badge, not an alert, so a long quiet operation doesn't cry wolf.
+
 ## Pull context without a link
 
 ```
@@ -129,7 +131,7 @@ sonar bar fg       # foreground (to see errors)
 
 The panel shows:
 
-- **Links** — your active cross‑session collaborations, each with agent badges (claude/codex), participants, last activity, and an **unread count**. Click a link to open the **doc viewer**: the shared `context.md` rendered inline, led by a *"▲ N new since you last viewed"* activity feed so you can see what changed at a glance. Quick actions: open the file, copy the ID, remove the link.
+- **Links** — your active cross‑session collaborations, each with agent badges (claude/codex), participants, last activity, an **unread count**, and a **⚙ worker chip** when workers are running. Click a link to open the **doc viewer**: a **Workers panel** (status + Log / Files / Stop), then the shared `context.md` rendered inline, led by a *"▲ N new since you last viewed"* activity feed so you can see what changed at a glance. Quick actions: open the file, copy the ID, remove the link.
 - **Running** — live `claude`/`codex` processes detected via `ps`+`lsof`, each with **Kill**, open folder, copy pid.
 - **Recent sessions** — your latest sessions from the index (● = active in the last few minutes), with open transcript, reveal in Finder, copy session id, and **Kill** when a live process matches.
 - **Start session** — pick a recent repo (or choose a folder) → launch `claude`/`codex` in your terminal.
