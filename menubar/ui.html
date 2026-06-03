@@ -215,7 +215,9 @@
     background: var(--accent); color: #fff; font-size: 10px; font-weight: 700; flex: none;
   }
   .linkrow { cursor: default; }
-  .docmeta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 2px 2px; color: var(--dim); font-size: 11px; }
+  .docmeta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 2px 2px; color: var(--dim); font-size: 11px; }
+  .docmeta .pchip { display: inline-flex; align-items: center; gap: 5px; }
+  .adot.off { background: var(--danger); box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 22%, transparent); }
   .docfeed { background: var(--bg-elev); border-radius: 9px; padding: 8px 10px; margin: 9px 0 4px; }
   .docfeed .fh { font-size: 10.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--accent); margin-bottom: 6px; }
   .newrow { font-size: 11.5px; color: var(--text); padding: 3px 0; line-height: 1.4; }
@@ -679,7 +681,7 @@ function renderDoc(r) {
       }).join('') + `</div>`;
   }
   const parts = (r.participants && r.participants.length)
-    ? r.participants.map(p => `${badge(p.agent)} ${esc(p.label)}`).join(' &nbsp; ')
+    ? r.participants.map(p => `<span class="pchip"><span class="adot ${p.connected ? 'on' : 'off'}" title="${p.connected ? 'connected' : 'disconnected'}"></span>${badge(p.agent)} ${esc(p.label)}</span>`).join('')
     : `<span>${esc(r.id)}</span>`;
   const meta = `<div class="docmeta">${parts}</div>`;
   const liveLabels = new Set((r.panes || []).filter(p => p && p.alive && p.label).map(p => p.label));

@@ -143,7 +143,7 @@ sonar bar fg       # foreground (to see errors)
 
 The panel shows:
 
-- **Links** — your active cross‑session collaborations, each with agent badges (claude/codex), participants, last activity, an **unread count**, and a **⚙ worker chip** when workers are running. Click a link to open the **doc viewer**: a **Workers panel** (status + Log / Files / Stop), then the shared `context.md` rendered inline, led by a *"▲ N new since you last viewed"* activity feed so you can see what changed at a glance. Quick actions: open the file, copy the ID, remove the link.
+- **Links** — your active cross‑session collaborations, each with agent badges (claude/codex), participants, last activity, an **unread count**, and a **⚙ worker chip** when workers are running. Click a link to open the **doc viewer**: participants each with a **connection light** (🟢 a live agent process / tmux pane in that cwd, 🔴 disconnected), a **Workers panel** (status + Log / Files / Stop / Wake), then the shared `context.md` rendered inline, led by a *"▲ N new since you last viewed"* activity feed so you can see what changed at a glance. Quick actions: open the file, copy the ID, remove the link.
 - **Running** — live `claude`/`codex` processes detected via `ps`+`lsof`, each with **Kill**, open folder, copy pid.
 - **Recent sessions** — your latest sessions from the index (● = active in the last few minutes), with open transcript, reveal in Finder, copy session id, and **Kill** when a live process matches.
 - **Start session** — pick a recent repo (or choose a folder) → launch `claude`/`codex` in your terminal.

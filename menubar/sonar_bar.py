@@ -405,11 +405,21 @@ def run_gui(cfg):
                 msgs = hub.get(f"/api/links/{lid}/messages?limit=300", []) or []
                 wks = hub.get(f"/api/workers?link_id={lid}", []) or []
                 panes = hub.get(f"/api/panes?link_id={lid}", []) or []
+                procs = hub.get("/api/procs", []) or []
                 last_seq = max([m.get("seq", 0) for m in msgs], default=0)
                 state = load_state()
+                # connection status per participant: a live agent process in its cwd,
+                # or an alive tmux pane → connected (green); otherwise disconnected (red).
+                norm = lambda s: (s or "").rstrip("/")
+                live_cwds = {norm(pr.get("cwd")) for pr in procs if pr.get("cwd")}
+                alive_labels = {pn.get("label") for pn in panes if pn.get("alive")}
+                parts = info.get("participants", []) or []
+                for part in parts:
+                    cwd = norm(part.get("cwd"))
+                    part["connected"] = bool((cwd and cwd in live_cwds) or (part.get("label") in alive_labels))
                 return {"id": lid, "markdown": doc.get("markdown", ""), "path": doc.get("path"),
                         "messages": msgs, "workers": wks, "panes": panes, "last_seq": last_seq, "seen_seq": state["seen"].get(lid, 0),
-                        "participants": info.get("participants", []), "link": info.get("link")}
+                        "participants": parts, "link": info.get("link")}
             if action == "stopWorker":
                 try:
                     return Hub(resolve_port())._post(f"/api/workers/{p['id']}/stop", {})
