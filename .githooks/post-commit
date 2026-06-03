@@ -1,0 +1,45 @@
+#!/bin/sh
+# sonar changelog hook.
+# Appends each commit's subject to CHANGELOG.md's "## [Unreleased]" section and
+# folds it into that same commit (via an --amend that re-runs us once, guarded).
+# Enable in a clone with:  git config core.hooksPath .githooks
+
+# Don't recurse on our own amend.
+[ -n "$SONAR_CHANGELOG_GUARD" ] && exit 0
+
+gitdir=$(git rev-parse --git-dir 2>/dev/null) || exit 0
+
+# Never rewrite merge / rebase / cherry-pick commits.
+[ -f "$gitdir/MERGE_HEAD" ] && exit 0
+{ [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; } && exit 0
+[ -f "$gitdir/CHERRY_PICK_HEAD" ] && exit 0
+
+subject=$(git log -1 --pretty=%s)
+
+# Skip subjects that aren't worth a changelog line.
+case "$subject" in
+  "Merge "*|"Revert "*|"changelog:"*|"Release "*|"chore: release"*) exit 0 ;;
+esac
+
+root=$(git rev-parse --show-toplevel) || exit 0
+cd "$root" || exit 0
+CL=CHANGELOG.md
+
+# Make sure the file and the [Unreleased] section exist.
+if [ ! -f "$CL" ]; then
+  printf '# Changelog\n\nNotable changes, newest first. Entries under **[Unreleased]** are auto-appended from commit subjects by `.githooks/post-commit`; edit them freely and roll them under a version heading at release time.\n\n## [Unreleased]\n' > "$CL"
+fi
+grep -q '^## \[Unreleased\]' "$CL" || printf '\n## [Unreleased]\n' >> "$CL"
+
+# Dedup: a plain `git commit --amend` (same subject) shouldn't add a duplicate.
+newest=$(grep -m1 '^- ' "$CL" | sed 's/^- //')
+[ "$newest" = "$subject" ] && exit 0
+
+# Insert "- <subject>" right after the [Unreleased] heading (newest first).
+tmp=$(mktemp) || exit 0
+awk -v e="- $subject" '{ print } /^## \[Unreleased\]/ && !d { print e; d=1 }' "$CL" > "$tmp" && mv "$tmp" "$CL"
+
+# Fold the changelog edit into this same commit; the amend re-fires us (guarded).
+git add "$CL"
+export SONAR_CHANGELOG_GUARD=1
+git commit --amend --no-edit --no-verify >/dev/null 2>&1

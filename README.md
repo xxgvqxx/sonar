@@ -210,6 +210,16 @@ Menu‑bar settings live in `~/.sonar/menubar.json` (terminal, agents, active wi
 - **Local only.** Binds `127.0.0.1` with no auth — don't expose the port.
 - **Headless worker mode** (`--headless`) relies on auto‑approving tools in the worker's isolated worktree; the interactive (visible terminal) path is the tested default.
 
+## Changelog
+
+[`CHANGELOG.md`](CHANGELOG.md) is maintained automatically. A tracked git hook (`.githooks/post-commit`) appends each commit's subject to the **[Unreleased]** section and folds it into that same commit, so the changelog never drifts from history. Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Write a clear commit subject and it becomes the changelog line; edit `CHANGELOG.md` freely and roll **[Unreleased]** under a version heading at release time. The hook skips merge/rebase/cherry-pick commits and subjects prefixed `Merge`, `Revert`, `Release`, or `changelog:`.
+
 ## Project layout
 
 ```
@@ -220,7 +230,7 @@ sonar/
     tools.ts      MCP tool definitions
     core.ts       links, messages, long-poll waiters + read cursors
     docs.ts       shared markdown doc read/append/section
-    spawn.ts      worker dispatch (git worktree + terminal/headless launch)
+    spawn.ts      worker dispatch (git worktree + terminal/headless launch) + worker registry/status
     sessions.ts   process detection (ps/lsof), session listing, safe kill
     indexer.ts    incremental transcript → FTS5 indexing
     db.ts         SQLite schema (node:sqlite)
@@ -229,6 +239,9 @@ sonar/
     sonar_bar.py  native menu-bar host (PyObjC: NSStatusItem + NSPopover + WKWebView)
     ui.html       the menu-bar UI (auto light/dark)
     pyproject.toml
+  .githooks/
+    post-commit   auto-appends commit subjects to CHANGELOG.md
+  CHANGELOG.md
   README.md
 ```
 
