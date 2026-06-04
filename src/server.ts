@@ -12,7 +12,14 @@ import * as docs from './docs.ts';
 import { spawnWorker, listWorktrees, pruneWorktree, listWorkers, stopWorker } from './spawn.ts';
 import { listPanes, wake } from './tmux.ts';
 import { startIndexer, reindexAll } from './indexer.ts';
-import { HOST, PORT, VERSION, PID_PATH, getToken, isLoopbackAddr } from './config.ts';
+import { HOST, PORT, VERSION, PID_PATH, getToken, isLoopbackAddr, allowRemoteExec } from './config.ts';
+
+/** Parse a query param as a finite number, else undefined (so NaN never reaches core/SQL/setTimeout). */
+function numQ(v: unknown): number | undefined {
+  if (v == null || v === '') return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
 
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
@@ -47,7 +54,7 @@ function suppliedToken(req: Request): string | undefined {
  * Returns false (and sends 403) when the caller must be blocked.
  */
 function requireLocalExec(req: Request, res: Response): boolean {
-  if (isLoopbackAddr(req.socket.remoteAddress) || process.env.SONAR_ALLOW_REMOTE_EXEC) return true;
+  if (isLoopbackAddr(req.socket.remoteAddress) || allowRemoteExec()) return true;
   res.status(403).json({ error: 'remote exec disabled: this endpoint runs code on the hub host. Set SONAR_ALLOW_REMOTE_EXEC=1 to permit.' });
   return false;
 }
@@ -109,6 +116,7 @@ export function startServer() {
     try {
       await fn(req, res);
     } catch (e) {
+      if (res.headersSent) return; // a response was already (partly) sent — don't double-send
       res.status(400).json({ error: (e as Error).message });
     }
   };
@@ -155,9 +163,7 @@ export function startServer() {
   app.get(
     '/api/links/:id/messages',
     wrap((req, res) => {
-      const since = req.query.since ? Number(req.query.since) : 0;
-      const limit = req.query.limit ? Number(req.query.limit) : undefined;
-      res.json(core.readMessages({ linkId: req.params.id, sinceSeq: since, limit }));
+      res.json(core.readMessages({ linkId: req.params.id, sinceSeq: numQ(req.query.since) ?? 0, limit: numQ(req.query.limit) }));
     })
   );
 
@@ -167,8 +173,8 @@ export function startServer() {
       const r = await core.waitForMessages({
         linkId: req.params.id,
         from: req.query.from as string | undefined,
-        afterSeq: req.query.after ? Number(req.query.after) : 0,
-        timeoutMs: req.query.timeout ? Number(req.query.timeout) : undefined,
+        afterSeq: numQ(req.query.after) ?? 0,
+        timeoutMs: numQ(req.query.timeout),
       });
       res.json(r);
     })
@@ -184,8 +190,8 @@ export function startServer() {
           repo: req.query.repo as string | undefined,
           agent: req.query.agent as string | undefined,
           sessionId: req.query.session_id as string | undefined,
-          sinceDays: req.query.since_days ? Number(req.query.since_days) : undefined,
-          limit: req.query.limit ? Number(req.query.limit) : undefined,
+          sinceDays: numQ(req.query.since_days),
+          limit: numQ(req.query.limit),
         })
       );
     })
@@ -195,9 +201,7 @@ export function startServer() {
   app.get(
     '/api/sessions',
     wrap(async (req, res) => {
-      const recent = req.query.recent ? Number(req.query.recent) : undefined;
-      const activeSecs = req.query.active_secs ? Number(req.query.active_secs) : undefined;
-      res.json(await sessions.listSessions({ recent, activeSecs }));
+      res.json(await sessions.listSessions({ recent: numQ(req.query.recent), activeSecs: numQ(req.query.active_secs) }));
     })
   );
 
@@ -218,7 +222,7 @@ export function startServer() {
 
   app.get(
     '/api/repos',
-    wrap((req, res) => res.json(sessions.listRepos(req.query.limit ? Number(req.query.limit) : undefined)))
+    wrap((req, res) => res.json(sessions.listRepos(numQ(req.query.limit))))
   );
 
   app.delete(
@@ -262,7 +266,8 @@ export function startServer() {
 
   app.post(
     '/api/reindex',
-    wrap((_req, res) => {
+    wrap((req, res) => {
+      if (!requireLocalExec(req, res)) return; // full-disk rescan of ~/.claude + ~/.codex — host-side work
       reindexAll();
       res.json({ ok: true, ...core.stats() });
     })
@@ -317,6 +322,14 @@ export function startServer() {
       res.json(await pruneWorktree(req.params.name));
     })
   );
+
+  // Terminal error handler: catches errors raised by middleware BEFORE a route runs
+  // (e.g. express.json's 413 PayloadTooLarge / 400 malformed-JSON), which wrap() can't see.
+  // Without this they hit Express's default handler (plain-text 500 + a stack frame).
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    if (res.headersSent) return;
+    res.status(err?.status || err?.statusCode || 400).json({ error: err?.message || 'bad request' });
+  });
 
   const server = app.listen(PORT, HOST, () => {
     startIndexer();

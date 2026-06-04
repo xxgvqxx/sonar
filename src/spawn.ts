@@ -113,6 +113,10 @@ export async function spawnWorker(opts: {
     try {
       await pexec('git', ['-C', root, 'worktree', 'add', '-b', branch, workdir], { timeout: 20000 });
     } catch (e) {
+      // git may have created the dir before failing — don't leave an orphan under ~/.sonar/worktrees.
+      try {
+        fs.rmSync(workdir, { recursive: true, force: true });
+      } catch {}
       throw new Error(`git worktree add failed: ${(e as Error).message}`);
     }
   }
@@ -255,7 +259,13 @@ export async function listWorktrees(): Promise<string[]> {
 }
 
 export async function pruneWorktree(name: string) {
-  const wt = path.join(WORKTREES, name);
+  const wt = path.resolve(WORKTREES, name);
+  // `name` comes from a URL param (DELETE /api/worktrees/:name) and could contain `..` or an
+  // absolute path. Only ever operate on a DIRECT child of WORKTREES — otherwise a crafted name
+  // would make the fs.rmSync below recursively delete an arbitrary directory.
+  if (path.dirname(wt) !== path.resolve(WORKTREES)) {
+    throw new Error(`invalid worktree name: ${name}`);
+  }
   // The owning repo is the worktree's common git dir's parent — NOT the worktree
   // itself (you can't `git worktree remove` the tree you're standing in).
   let mainRepo: string | null = null;

@@ -326,6 +326,7 @@ function resourcesOverlap(a: string, b: string): boolean {
   const x = normResource(a);
   const y = normResource(b);
   if (x === y) return true;
+  if (x === '/' || y === '/') return true; // root covers everything beneath it
   return y.startsWith(x + '/') || x.startsWith(y + '/');
 }
 
@@ -494,6 +495,14 @@ export function deleteLink(linkId: string) {
   db.prepare('DELETE FROM tasks WHERE link_id = ?').run(linkId);
   db.prepare('DELETE FROM git_state WHERE link_id = ?').run(linkId);
   const info = db.prepare('DELETE FROM links WHERE id = ?').run(linkId);
+  // Release any parked long-poll waiters and prune their read-cursors, so repeated
+  // create/delete churn doesn't grow these in-memory maps without bound.
+  const set = waiters.get(linkId);
+  if (set) {
+    for (const w of [...set]) w.resolve();
+    waiters.delete(linkId);
+  }
+  for (const key of [...cursors.keys()]) if (key.startsWith(`${linkId}:`)) cursors.delete(key);
   return { deleted: Number(info.changes) > 0 };
 }
 

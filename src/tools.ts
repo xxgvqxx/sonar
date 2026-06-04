@@ -3,7 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as core from './core.ts';
 import * as docs from './docs.ts';
 import { spawnWorker } from './spawn.ts';
-import { LAN_MODE, isLoopbackAddr } from './config.ts';
+import { LAN_MODE, isLoopbackAddr, allowRemoteExec } from './config.ts';
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
 
@@ -69,10 +69,22 @@ function syncTasks(linkId: string) {
   docs.setSection(linkId, 'Tasks', body);
 }
 
+// g.files is a JSON-stringified array written by setGitState — but parse defensively so a
+// malformed/hand-edited/legacy row can never throw out of gitLine → syncGit → link_join/create.
+function parseFiles(raw: unknown): string[] {
+  if (!raw || typeof raw !== 'string') return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
 function gitLine(g: any): string {
   const head = g.head_sha ? ` @ ${String(g.head_sha).slice(0, 7)}` : '';
   const track = [g.ahead ? `↑${g.ahead}` : '', g.behind ? `↓${g.behind}` : ''].filter(Boolean).join(' ');
-  const files = g.files ? (JSON.parse(g.files) as string[]) : [];
+  const files = parseFiles(g.files);
   const line = `- **${g.label}** — \`${g.branch ?? '?'}\`${head}${track ? ` · ${track}` : ''}${g.changed != null ? ` · ${g.changed} changed` : ''} · ${fmtTime(g.updated_at)}`;
   return files.length ? `${line}\n    ${files.slice(0, 8).join(', ')}` : line;
 }
@@ -141,7 +153,7 @@ const TOOL_GUIDE: { name: string; purpose: string; example: string }[] = [
 export function registerTools(server: McpServer, opts: { remoteAddr?: string } = {}) {
   // In LAN mode, host-mutating tools are refused for remote callers unless explicitly allowed.
   // (Local/loopback agents on the hub machine are always permitted; default loopback mode is unaffected.)
-  const remoteExecBlocked = () => LAN_MODE && !isLoopbackAddr(opts.remoteAddr) && !process.env.SONAR_ALLOW_REMOTE_EXEC;
+  const remoteExecBlocked = () => LAN_MODE && !isLoopbackAddr(opts.remoteAddr) && !allowRemoteExec();
 
   server.registerTool(
     'sonar_help',

@@ -3,6 +3,7 @@
 Notable changes, newest first. Entries under **[Unreleased]** are auto-appended from commit subjects by `.githooks/post-commit` (enable in a clone with `git config core.hooksPath .githooks`); edit them freely and roll them under a version heading at release time.
 
 ## [Unreleased]
+- **2026-06-04** — Fix bugs found in a full-codebase audit
 - **2026-06-04** — Add coordination primitives: claims, task board, git presence
 - **2026-06-04** — Add sonar_help: a capabilities directory agents can look up
 - **2026-06-04** — Bound the shared doc: compact + section reads, Log rotation, terse pings

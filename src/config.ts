@@ -63,6 +63,16 @@ export function isLoopbackAddr(addr?: string): boolean {
 export const LAN_MODE = !isLoopbackHost(HOST);
 
 /**
+ * Whether remote (non-loopback) callers may hit the code-exec surface (spawn/kill/wake/...).
+ * Parsed as a real boolean: only 1/true/yes/on enable it. Plain truthiness would treat
+ * SONAR_ALLOW_REMOTE_EXEC=0 (or =false) as ENABLED — the opposite of what an operator means.
+ */
+export function allowRemoteExec(): boolean {
+  const v = (process.env.SONAR_ALLOW_REMOTE_EXEC || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
+/**
  * Shared access token: SONAR_TOKEN env > `token` in ~/.sonar/config.json > none.
  * Mutable so the daemon can generate + install one at boot in LAN mode (see setToken).
  * Read it LIVE via getToken() — never capture it as a const at module load.

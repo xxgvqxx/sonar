@@ -43,13 +43,20 @@ function writePortConfig(port: number) {
 }
 
 function isRunning(): number | null {
+  let pid: number;
   try {
-    const pid = Number(fs.readFileSync(PID_PATH, 'utf8').trim());
-    if (pid && (process.kill(pid, 0) as any) !== false) return pid;
+    pid = Number(fs.readFileSync(PID_PATH, 'utf8').trim());
   } catch {
-    /* not running */
+    return null; // no pidfile
   }
-  return null;
+  if (!pid) return null;
+  try {
+    process.kill(pid, 0); // signal 0 = existence check
+    return pid;
+  } catch (e) {
+    // EPERM = the process exists but is owned by another user → still running.
+    return (e as NodeJS.ErrnoException).code === 'EPERM' ? pid : null;
+  }
 }
 
 async function api(method: string, route: string, body?: any): Promise<any> {
@@ -136,6 +143,7 @@ function spawnDaemon(displayUrl = BASE_URL) {
     stdio: ['ignore', out, out],
   });
   child.unref();
+  fs.closeSync(out); // the child holds its own dup'd fd; don't leak ours in the parent
   console.log(`sonar hub starting on ${displayUrl} (pid ${child.pid}) — logs: ${LOG_PATH}`);
 }
 

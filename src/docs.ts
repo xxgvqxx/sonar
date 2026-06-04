@@ -16,6 +16,14 @@ const LOG_MAX = 60; // recent Log entries retained in context.md; older ones rot
 const now = () => new Date().toISOString();
 const hhmm = () => new Date().toISOString().slice(11, 16);
 
+// A bare `## ` line inside section content would be mis-read as a section boundary by
+// sectionBounds, splitting the doc and corrupting every later section read/write. Demote
+// any h2 in stored user content to h3 (deeper headings don't collide with the `^##\s` scan).
+// Idempotent: "### x" no longer matches `^(##)(\s)`.
+function neutralizeHeadings(text: string): string {
+  return text.replace(/^(##)(\s)/gm, '#$1$2');
+}
+
 export function linkDir(linkId: string): string {
   return path.join(LINKS_DIR, linkId);
 }
@@ -155,7 +163,11 @@ export function appendToSection(linkId: string, section: string, text: string, f
   const p = docPath(linkId);
   const lines = fs.readFileSync(p, 'utf8').split('\n');
 
-  const entry = (from ? `> ${from} · ${hhmm()}\n` : '') + text.trim() + '\n';
+  let safe = neutralizeHeadings(text.trim());
+  // The Log is entry-counted by blank-line boundaries (splitLogEntries) for rotation/compaction;
+  // collapse internal blank lines so a multi-paragraph note still counts as ONE Log entry.
+  if (section.trim().toLowerCase() === 'log') safe = safe.replace(/\n\s*\n+/g, '\n');
+  const entry = (from ? `> ${from} · ${hhmm()}\n` : '') + safe + '\n';
 
   // find the section header line
   let start = -1;
@@ -205,7 +217,7 @@ export function setSection(linkId: string, section: string, text: string): { pat
       break;
     }
   }
-  const body = ['', text.trim(), ''];
+  const body = ['', neutralizeHeadings(text.trim()), ''];
   if (start === -1) {
     if (lines.length && lines[lines.length - 1].trim() !== '') lines.push('');
     lines.push(`## ${section}`, ...body);
