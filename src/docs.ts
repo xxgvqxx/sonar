@@ -4,7 +4,10 @@ import { DATA_DIR } from './config.ts';
 
 const LINKS_DIR = path.join(DATA_DIR, 'links');
 
-const SECTIONS = ['Participants', 'Context', 'Open questions', 'Answers', 'Decisions', 'Log'];
+// Coordination-state sections (Tasks/Claims/Git) sit near the top so an agent sees who
+// holds what and what's in flight on every read. They're rewritten wholesale from the DB
+// (like Participants), so they stay bounded — only the append-only Log grows.
+const SECTIONS = ['Participants', 'Tasks', 'Claims', 'Git', 'Context', 'Open questions', 'Answers', 'Decisions', 'Log'];
 
 // Token discipline for the Log section: keep it bounded both on disk and in compact reads.
 const LOG_KEEP = 12; // recent Log entries surfaced in a compact doc_read

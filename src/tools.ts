@@ -38,6 +38,49 @@ function fmtTime(iso?: string) {
   return iso.replace('T', ' ').replace(/\.\d+Z$/, 'Z');
 }
 
+/** Minutes until an ISO timestamp, as "23m" / "expired". */
+function fmtMins(iso: string): string {
+  const m = Math.round((new Date(iso).getTime() - Date.now()) / 60_000);
+  return m <= 0 ? 'expired' : `${m}m`;
+}
+
+// Rebuild the doc's coordination sections from the DB (replace, so they never bloat).
+function syncClaims(linkId: string) {
+  const rows = core.listClaims(linkId);
+  const body = rows.length
+    ? rows
+        .map((c) => `- \`${c.resource}\` — **${c.holder}** · exp ${fmtTime(c.expires_at)} (${fmtMins(c.expires_at)})${c.note ? ` · ${c.note}` : ''}`)
+        .join('\n')
+    : '_(none — no active leases)_';
+  docs.setSection(linkId, 'Claims', body);
+}
+
+const TASK_BADGE: Record<string, string> = { todo: '☐', doing: '▶', done: '✓', blocked: '⛔' };
+function syncTasks(linkId: string) {
+  const rows = core.listTasks({ linkId });
+  const body = rows.length
+    ? rows
+        .map(
+          (t) =>
+            `- ${TASK_BADGE[t.status] ?? '·'} **#${t.num}** ${t.title} — ${t.status} · ${t.assignee || 'unassigned'}${t.note ? `\n    ${t.note}` : ''}`
+        )
+        .join('\n')
+    : '_(no tasks yet)_';
+  docs.setSection(linkId, 'Tasks', body);
+}
+
+function gitLine(g: any): string {
+  const head = g.head_sha ? ` @ ${String(g.head_sha).slice(0, 7)}` : '';
+  const track = [g.ahead ? `↑${g.ahead}` : '', g.behind ? `↓${g.behind}` : ''].filter(Boolean).join(' ');
+  const files = g.files ? (JSON.parse(g.files) as string[]) : [];
+  const line = `- **${g.label}** — \`${g.branch ?? '?'}\`${head}${track ? ` · ${track}` : ''}${g.changed != null ? ` · ${g.changed} changed` : ''} · ${fmtTime(g.updated_at)}`;
+  return files.length ? `${line}\n    ${files.slice(0, 8).join(', ')}` : line;
+}
+function syncGit(linkId: string) {
+  const rows = core.listGitState(linkId);
+  docs.setSection(linkId, 'Git', rows.length ? rows.map(gitLine).join('\n') : '_(no git state reported)_');
+}
+
 function renderMessages(msgs: any[]): string {
   if (!msgs.length) return '(no messages)';
   return msgs
@@ -69,6 +112,9 @@ const DECISION_MAP: [need: string, use: string][] = [
   ['catch up after a ping, or before you start working', 'doc_read (compact by default) — or read(since_seq=…) for just new messages'],
   ['contribute context / ask a question / record an answer', 'doc_append(section="Context" | "Open questions" | "Answers")'],
   ['record a decision, or keep a bounded contract (API shape, types)', 'doc_set_section (replace = stays bounded, no append bloat)'],
+  ['avoid clobbering a file the other session may also edit', 'claim(resource="path", from=…) BEFORE you edit it — release() when done'],
+  ['split the work and track who is doing what', 'task_add then task_update(status="doing"|"done", assignee=you) — board shows in the doc "Tasks"'],
+  ["see the other session's branch / ahead-behind / changed files", 'git_sync(from=…, branch=…, ahead=…, behind=…, changed=…, files=[…])'],
   ['dispatch an autonomous subtask that reports back', 'spawn_worker(task=…)  — headless=true to run in the background'],
   ['pull context from your OWN past Claude/Codex sessions', 'search_context(query=…, repo?/branch?/agent?)'],
   ['discover what links or sessions already exist', 'link_list / link_info / recent_sessions'],
@@ -81,6 +127,9 @@ const TOOL_GUIDE: { name: string; purpose: string; example: string }[] = [
   { name: 'doc_read', purpose: 'read the shared doc — compact by default; section="…" for one section; full=true for everything', example: 'doc_read(link_id="k7m2", section="Open questions")' },
   { name: 'doc_append', purpose: 'append to a section (Context / Open questions / Answers / Decisions) and ping waiters', example: 'doc_append(link_id="k7m2", section="Answers", from="claude@feat/auth", text="Q… → A…")' },
   { name: 'doc_set_section', purpose: 'replace a whole section — use for current-state (Decisions, the API contract) so it stays bounded', example: 'doc_set_section(link_id="k7m2", section="Decisions", text="…")' },
+  { name: 'claim / release', purpose: 'lease a file/dir so the peer avoids clobbering you (path-overlap aware, auto-expiring; steal=true overrides a stale one). Shows in the doc "Claims"', example: 'claim(link_id="k7m2", resource="apps/web/api-client.ts", from="claude@feat/auth")' },
+  { name: 'task_add / task_update', purpose: 'shared todo/doing/done board (shows in the doc "Tasks"); task_update to claim (status="doing", assignee=you) or finish (status="done")', example: 'task_update(link_id="k7m2", num=2, from="codex@main", status="doing", assignee="codex@main")' },
+  { name: 'git_sync', purpose: "report your branch / ahead-behind / changed files and get the peers' back — frontend⇄backend awareness. Shows in the doc \"Git\"", example: 'git_sync(link_id="k7m2", from="claude@feat/auth", branch="feat/auth", ahead=2, changed=3, files=["shared/types.ts"])' },
   { name: 'post', purpose: 'send a short "doc changed" / question ping to the other session; pair with wait', example: 'post(link_id="k7m2", from="claude@feat/auth", body="answered your Q in the doc")' },
   { name: 'read', purpose: 'read messages since a seq WITHOUT blocking (quick catch-up)', example: 'read(link_id="k7m2", since_seq=12)' },
   { name: 'wait', purpose: 'long-poll until a new message arrives (loop it); per-participant cursor advances automatically', example: 'wait(link_id="k7m2", from="claude@feat/auth")' },
@@ -111,6 +160,7 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
           `TOOLS\n${guide}\n\n` +
           `NOTES\n` +
           `• Typical flow: link_create / link_join → doc_read → doc_append your context → post a ping → wait() in a loop, re-reading the doc on each ping. Put substantive content in the DOC, not just in pings.\n` +
+          `• Coordination state lives in the doc too: claim/release → "Claims" section, task_add/task_update → "Tasks", git_sync → "Git". So a single doc_read shows who holds which files, the task board, and each side's git state. Before editing a shared file, claim() it; before picking up work, read the Tasks section.\n` +
           `• doc_read is compact by default (Log trimmed, older entries archived); pass section="Log" or full=true for more.\n` +
           `• Re-prompting a PAUSED agent in place is an operator action (shell: "sonar wake <link> <label> [prompt]"), not an MCP tool — it needs the session to be running under tmux.`
       );
@@ -129,6 +179,9 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
       const { id } = core.createLink({ title: a.title, who: a });
       const docFile = docs.ensureDoc(id, a.title);
       syncParticipants(id);
+      syncTasks(id);
+      syncClaims(id);
+      syncGit(id);
       docs.appendLog(id, a.label, 'created the link');
       return text(
         `Created sonar link: ${id}${a.title ? ` — ${a.title}` : ''}\n` +
@@ -154,6 +207,9 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
       const r = core.joinLink({ linkId: a.link_id, who: a });
       const docFile = docs.ensureDoc(a.link_id, r.link?.title);
       syncParticipants(a.link_id);
+      syncClaims(a.link_id);
+      syncTasks(a.link_id);
+      syncGit(a.link_id);
       docs.appendLog(a.link_id, a.label, 'joined the link');
       const doc = docs.readDoc(a.link_id, { compact: true });
       return text(
@@ -380,6 +436,161 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
       docs.setSection(a.link_id, a.section, a.text);
       if (a.from) core.postMessage({ linkId: a.link_id, from: a.from, body: `📝 rewrote doc section "${a.section}"` });
       return text(`Section "${a.section}" replaced. Doc: ${docs.docPath(a.link_id)}` + pending(a.link_id, a.from));
+    }
+  );
+
+  // ---- coordination state: claims (leases), task board, git presence ----
+  server.registerTool(
+    'claim',
+    {
+      title: 'Claim a file/resource (lease)',
+      description:
+        'Take a short-lived lease on a file, directory, or named resource so the other session knows you are editing it and avoids clobbering you. ' +
+        'Conflicts are detected by path overlap (claiming a directory covers the files under it). If someone else already holds an overlapping lease this RETURNS the conflict (who, until when) instead of acquiring — work elsewhere, or pass steal=true to override a clearly stale one. ' +
+        'Re-claiming your own resource extends it. Leases auto-expire (default 30 min). The active set surfaces in the doc under "Claims".',
+      inputSchema: {
+        link_id: z.string(),
+        resource: z.string().describe('What you are claiming — usually a path, e.g. "apps/web/api-client.ts" or "apps/web" (a dir covers its files). Any label works.'),
+        from: z.string().describe('Your participant label (the lease holder).'),
+        ttl_min: z.number().optional().describe('Lease length in minutes (default 30, max 240). Re-claim to extend.'),
+        note: z.string().optional().describe('Optional note, e.g. "refactoring the client".'),
+        agent: z.string().optional(),
+        steal: z.boolean().optional().describe('Override an existing conflicting lease held by someone else (only when it is clearly stale).'),
+      },
+    },
+    async (a) => {
+      if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
+      const r = core.claimResource({ linkId: a.link_id, resource: a.resource, holder: a.from, agent: a.agent, ttlMin: a.ttl_min, note: a.note, steal: a.steal });
+      if (!r.ok) {
+        const c = r.conflicts.map((x: any) => `\`${x.resource}\` held by ${x.holder} until ${fmtTime(x.expires_at)} (${fmtMins(x.expires_at)})`).join('; ');
+        return text(`✋ Could not claim "${a.resource}" — conflicting lease: ${c}.\nWork elsewhere, coordinate in the doc, or re-call with steal=true if it is stale.`);
+      }
+      syncClaims(a.link_id);
+      core.postMessage({ linkId: a.link_id, from: a.from, body: `🔒 ${a.from} claimed ${r.claim.resource}${r.stole?.length ? ' (stole a stale lease)' : ''}` });
+      return text(
+        `Claimed "${r.claim.resource}" until ${fmtTime(r.claim.expires_at)} (${fmtMins(r.claim.expires_at)})${r.extended ? ' — extended' : ''}.\n` +
+          `Release with release(link_id="${a.link_id}", resource="${r.claim.resource}", from="${a.from}") when done.` +
+          pending(a.link_id, a.from)
+      );
+    }
+  );
+
+  server.registerTool(
+    'release',
+    {
+      title: 'Release a claim',
+      description: 'Release a lease you hold on a resource so the other session can edit it. Pings the link. Leases also auto-expire, so this is optional but courteous.',
+      inputSchema: {
+        link_id: z.string(),
+        resource: z.string().describe('The exact resource you claimed.'),
+        from: z.string().describe('Your participant label.'),
+      },
+    },
+    async (a) => {
+      if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
+      const r = core.releaseClaim({ linkId: a.link_id, resource: a.resource, holder: a.from });
+      syncClaims(a.link_id);
+      if (r.released) core.postMessage({ linkId: a.link_id, from: a.from, body: `🔓 ${a.from} released ${a.resource}` });
+      return text(r.released ? `Released ${r.released} lease(s) on "${a.resource}".` : `No active lease by "${a.from}" on "${a.resource}".`);
+    }
+  );
+
+  server.registerTool(
+    'task_add',
+    {
+      title: 'Add a task to the shared board',
+      description:
+        'Add a task to the link\'s shared task board (status starts at "todo"). The board surfaces in the doc under "Tasks". Use it to split work between sessions and track who owns what; the returned number (#N) is how you update it later.',
+      inputSchema: {
+        link_id: z.string(),
+        title: z.string().describe('Short task description.'),
+        from: z.string().describe('Your participant label (recorded as creator).'),
+        assignee: z.string().optional().describe('Who should own it (a participant label), if known.'),
+        note: z.string().optional(),
+      },
+    },
+    async (a) => {
+      if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
+      const t = core.createTask({ linkId: a.link_id, title: a.title, assignee: a.assignee, note: a.note, by: a.from });
+      syncTasks(a.link_id);
+      core.postMessage({ linkId: a.link_id, from: a.from, body: `🆕 task #${t.num}: ${t.title}${t.assignee ? ` → ${t.assignee}` : ''}` });
+      return text(
+        `Added task #${t.num} "${t.title}" (${t.status}${t.assignee ? `, → ${t.assignee}` : ''}).\n` +
+          `Claim/progress it with task_update(link_id="${a.link_id}", num=${t.num}, from="${a.from}", status="doing", assignee="${a.from}"); finish with status="done".` +
+          pending(a.link_id, a.from)
+      );
+    }
+  );
+
+  server.registerTool(
+    'task_update',
+    {
+      title: 'Update a task (claim / progress / done)',
+      description:
+        'Change a task\'s status (todo → doing → done, or blocked), claim it by setting assignee to yourself, and/or add a note. This is how you "claim" a task (status="doing", assignee=you) and mark it "done". Pings the link.',
+      inputSchema: {
+        link_id: z.string(),
+        num: z.number().describe('The task number (#N) shown on the board.'),
+        from: z.string().describe('Your participant label.'),
+        status: z.enum(['todo', 'doing', 'done', 'blocked']).optional(),
+        assignee: z.string().optional().describe('Set the owner (use your own label to claim it).'),
+        note: z.string().optional(),
+      },
+    },
+    async (a) => {
+      if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
+      let t: any;
+      try {
+        t = core.updateTask({ linkId: a.link_id, num: a.num, status: a.status, assignee: a.assignee, note: a.note });
+      } catch (e) {
+        return text((e as Error).message);
+      }
+      syncTasks(a.link_id);
+      core.postMessage({ linkId: a.link_id, from: a.from, body: `📌 task #${t.num} → ${t.status}${t.assignee ? ` (${t.assignee})` : ''}` });
+      return text(`Task #${t.num} "${t.title}" is now ${t.status}${t.assignee ? ` · ${t.assignee}` : ''}.` + pending(a.link_id, a.from));
+    }
+  );
+
+  server.registerTool(
+    'git_sync',
+    {
+      title: 'Report your git state + see the others',
+      description:
+        "Publish your current git state to the link and get back what every other participant last reported — so a frontend/backend pair can see each other's branch, ahead/behind, and which files changed. Run these locally and pass the results:\n" +
+        '  branch:   git branch --show-current\n' +
+        '  head:     git rev-parse --short HEAD\n' +
+        '  ahead/behind: git rev-list --left-right --count @{u}...HEAD  (behind = left, ahead = right; omit if no upstream)\n' +
+        '  changed + files: git status --porcelain  (count the lines for "changed"; pass a few notable paths)\n' +
+        'Surfaces in the doc under "Git". Call it after you commit/pull, or whenever you want to sync. (Reporting only — it does not run git for you.)',
+      inputSchema: {
+        link_id: z.string(),
+        from: z.string().describe('Your participant label.'),
+        branch: z.string().optional(),
+        head: z.string().optional().describe('Short HEAD sha.'),
+        upstream: z.string().optional().describe('Upstream ref, e.g. origin/main.'),
+        ahead: z.number().optional(),
+        behind: z.number().optional(),
+        changed: z.number().optional().describe('Count of changed files (git status --porcelain line count).'),
+        files: z.array(z.string()).optional().describe('A handful of notable changed paths (surfaced so peers spot overlap).'),
+      },
+    },
+    async (a) => {
+      if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
+      const all = core.setGitState({
+        linkId: a.link_id,
+        label: a.from,
+        branch: a.branch,
+        head: a.head,
+        upstream: a.upstream,
+        ahead: a.ahead,
+        behind: a.behind,
+        changed: a.changed,
+        files: a.files,
+      });
+      syncGit(a.link_id);
+      const peers = all.filter((g: any) => g.label !== a.from);
+      const peerText = peers.length ? peers.map(gitLine).join('\n') : '(no other participant has reported git state yet)';
+      return text(`Synced your git state to ${a.link_id}.\nOther participants:\n${peerText}` + pending(a.link_id, a.from));
     }
   );
 

@@ -43,6 +43,53 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_messages_link ON messages (link_id, seq);
 
+  -- Resource leases: an agent claims a file/dir/label so peers avoid clobbering it.
+  -- released_at IS NULL && expires_at > now() == active. Expiry is lazy (filtered in queries).
+  CREATE TABLE IF NOT EXISTS claims (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    link_id     TEXT NOT NULL,
+    resource    TEXT NOT NULL,
+    holder      TEXT NOT NULL,
+    agent       TEXT,
+    note        TEXT,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    released_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_claims_link ON claims (link_id, released_at, expires_at);
+
+  -- Shared task board: lightweight todo/doing/done/blocked coordination per link.
+  -- num is a per-link human number (like messages.seq).
+  CREATE TABLE IF NOT EXISTS tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    link_id     TEXT NOT NULL,
+    num         INTEGER NOT NULL,
+    title       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'todo',
+    assignee    TEXT,
+    note        TEXT,
+    created_by  TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_tasks_link ON tasks (link_id, num);
+
+  -- Latest git snapshot each participant reports. Agent-reported (not hub-derived) so it
+  -- works cross-machine — the hub can't see a remote teammate's working tree.
+  CREATE TABLE IF NOT EXISTS git_state (
+    link_id    TEXT NOT NULL,
+    label      TEXT NOT NULL,
+    branch     TEXT,
+    head_sha   TEXT,
+    upstream   TEXT,
+    ahead      INTEGER,
+    behind     INTEGER,
+    changed    INTEGER,
+    files      TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (link_id, label)
+  );
+
   -- Incremental tail state for each indexed JSONL log file.
   CREATE TABLE IF NOT EXISTS idx_files (
     path       TEXT PRIMARY KEY,

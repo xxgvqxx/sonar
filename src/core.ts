@@ -312,9 +312,187 @@ export function recentSessions(opts: { repo?: string; branch?: string; agent?: s
     .all(...params) as any[];
 }
 
+// ---------------------------------------------------------------------------
+// Resource claims (leases) — keep two agents off the same file/dir.
+// ---------------------------------------------------------------------------
+/** Normalise a resource string: trim, forward-slashes, no trailing slash (except root). */
+function normResource(r: string): string {
+  const t = r.trim().replace(/\\/g, '/');
+  return t.length > 1 ? t.replace(/\/+$/, '') : t;
+}
+
+/** Two resources conflict if equal, or one is a path-prefix of the other (a dir covers its files). */
+function resourcesOverlap(a: string, b: string): boolean {
+  const x = normResource(a);
+  const y = normResource(b);
+  if (x === y) return true;
+  return y.startsWith(x + '/') || x.startsWith(y + '/');
+}
+
+function getClaim(id: number) {
+  return db.prepare('SELECT id, resource, holder, agent, note, created_at, expires_at FROM claims WHERE id = ?').get(id) as any;
+}
+
+/** Active (unreleased, unexpired) leases on a link. */
+export function listClaims(linkId: string) {
+  return db
+    .prepare(
+      `SELECT id, resource, holder, agent, note, created_at, expires_at
+       FROM claims WHERE link_id = ? AND released_at IS NULL AND expires_at > ?
+       ORDER BY created_at`
+    )
+    .all(linkId, now()) as any[];
+}
+
+/**
+ * Acquire (or extend) a lease. Returns {ok:false, conflicts} when another holder has an
+ * overlapping active lease and steal is not set; otherwise {ok:true, claim, extended?, stole}.
+ */
+export function claimResource(opts: {
+  linkId: string;
+  resource: string;
+  holder: string;
+  agent?: string;
+  ttlMin?: number;
+  note?: string;
+  steal?: boolean;
+}) {
+  if (!linkExists(opts.linkId)) throw new Error(`No link with id "${opts.linkId}".`);
+  const resource = normResource(opts.resource);
+  if (!resource) throw new Error('resource is required');
+  const ttl = Math.min(Math.max(opts.ttlMin ?? 30, 1), 240);
+  const ts = now();
+  const expiresAt = new Date(Date.now() + ttl * 60_000).toISOString();
+
+  const active = listClaims(opts.linkId);
+  const blocking = active.filter((c) => c.holder !== opts.holder && resourcesOverlap(c.resource, resource));
+  if (blocking.length && !opts.steal) return { ok: false as const, conflicts: blocking };
+
+  const stole: any[] = [];
+  if (blocking.length && opts.steal) {
+    for (const c of blocking) {
+      db.prepare('UPDATE claims SET released_at = ? WHERE id = ?').run(ts, c.id);
+      stole.push(c);
+    }
+  }
+
+  // Re-claiming your own exact resource extends it rather than stacking duplicates.
+  const mine = active.find((c) => c.holder === opts.holder && normResource(c.resource) === resource);
+  if (mine) {
+    db.prepare('UPDATE claims SET expires_at = ?, note = COALESCE(?, note) WHERE id = ?').run(expiresAt, opts.note ?? null, mine.id);
+    touchParticipant(opts.linkId, { label: opts.holder, agent: opts.agent });
+    return { ok: true as const, claim: getClaim(mine.id), extended: true, stole };
+  }
+  const info = db
+    .prepare('INSERT INTO claims (link_id, resource, holder, agent, note, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(opts.linkId, resource, opts.holder, opts.agent ?? null, opts.note ?? null, ts, expiresAt);
+  touchParticipant(opts.linkId, { label: opts.holder, agent: opts.agent });
+  return { ok: true as const, claim: getClaim(Number(info.lastInsertRowid)), stole };
+}
+
+export function releaseClaim(opts: { linkId: string; resource: string; holder: string }) {
+  const resource = normResource(opts.resource);
+  const ts = now();
+  const mine = listClaims(opts.linkId).filter((c) => c.holder === opts.holder && normResource(c.resource) === resource);
+  for (const c of mine) db.prepare('UPDATE claims SET released_at = ? WHERE id = ?').run(ts, c.id);
+  return { released: mine.length };
+}
+
+// ---------------------------------------------------------------------------
+// Shared task board
+// ---------------------------------------------------------------------------
+export const TASK_STATUS = ['todo', 'doing', 'done', 'blocked'] as const;
+
+export function getTask(linkId: string, num: number) {
+  return db
+    .prepare('SELECT num, title, status, assignee, note, created_by, created_at, updated_at FROM tasks WHERE link_id = ? AND num = ?')
+    .get(linkId, num) as any;
+}
+
+export function listTasks(opts: { linkId: string; status?: string }) {
+  if (opts.status) {
+    return db
+      .prepare('SELECT num, title, status, assignee, note, updated_at FROM tasks WHERE link_id = ? AND status = ? ORDER BY num')
+      .all(opts.linkId, opts.status) as any[];
+  }
+  return db.prepare('SELECT num, title, status, assignee, note, updated_at FROM tasks WHERE link_id = ? ORDER BY num').all(opts.linkId) as any[];
+}
+
+export function createTask(opts: { linkId: string; title: string; assignee?: string; note?: string; by?: string }) {
+  if (!linkExists(opts.linkId)) throw new Error(`No link with id "${opts.linkId}".`);
+  if (!opts.title?.trim()) throw new Error('title is required');
+  const ts = now();
+  const numRow = db.prepare('SELECT COALESCE(MAX(num), 0) + 1 AS next FROM tasks WHERE link_id = ?').get(opts.linkId) as any;
+  const num = numRow.next as number;
+  db.prepare(
+    `INSERT INTO tasks (link_id, num, title, status, assignee, note, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, 'todo', ?, ?, ?, ?, ?)`
+  ).run(opts.linkId, num, opts.title.trim(), opts.assignee ?? null, opts.note ?? null, opts.by ?? null, ts, ts);
+  return getTask(opts.linkId, num);
+}
+
+export function updateTask(opts: { linkId: string; num: number; status?: string; assignee?: string; note?: string }) {
+  const task = getTask(opts.linkId, opts.num);
+  if (!task) throw new Error(`No task #${opts.num} on ${opts.linkId}.`);
+  if (opts.status && !TASK_STATUS.includes(opts.status as any)) throw new Error(`status must be one of: ${TASK_STATUS.join(', ')}`);
+  db.prepare(
+    `UPDATE tasks SET status = COALESCE(?, status), assignee = COALESCE(?, assignee), note = COALESCE(?, note), updated_at = ?
+     WHERE link_id = ? AND num = ?`
+  ).run(opts.status ?? null, opts.assignee ?? null, opts.note ?? null, now(), opts.linkId, opts.num);
+  return getTask(opts.linkId, opts.num);
+}
+
+// ---------------------------------------------------------------------------
+// Git presence — each participant reports its own tree (works cross-machine).
+// ---------------------------------------------------------------------------
+export function listGitState(linkId: string) {
+  return db
+    .prepare('SELECT label, branch, head_sha, upstream, ahead, behind, changed, files, updated_at FROM git_state WHERE link_id = ? ORDER BY updated_at DESC')
+    .all(linkId) as any[];
+}
+
+export function setGitState(opts: {
+  linkId: string;
+  label: string;
+  branch?: string;
+  head?: string;
+  upstream?: string;
+  ahead?: number;
+  behind?: number;
+  changed?: number;
+  files?: string[];
+}) {
+  if (!linkExists(opts.linkId)) throw new Error(`No link with id "${opts.linkId}".`);
+  const files = opts.files && opts.files.length ? JSON.stringify(opts.files.slice(0, 20)) : null;
+  db.prepare(
+    `INSERT INTO git_state (link_id, label, branch, head_sha, upstream, ahead, behind, changed, files, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(link_id, label) DO UPDATE SET
+       branch = excluded.branch, head_sha = excluded.head_sha, upstream = excluded.upstream,
+       ahead = excluded.ahead, behind = excluded.behind, changed = excluded.changed,
+       files = excluded.files, updated_at = excluded.updated_at`
+  ).run(
+    opts.linkId,
+    opts.label,
+    opts.branch ?? null,
+    opts.head ?? null,
+    opts.upstream ?? null,
+    opts.ahead ?? null,
+    opts.behind ?? null,
+    opts.changed ?? null,
+    files,
+    now()
+  );
+  touchParticipant(opts.linkId, { label: opts.label, branch: opts.branch });
+  return listGitState(opts.linkId);
+}
+
 export function deleteLink(linkId: string) {
   db.prepare('DELETE FROM messages WHERE link_id = ?').run(linkId);
   db.prepare('DELETE FROM participants WHERE link_id = ?').run(linkId);
+  db.prepare('DELETE FROM claims WHERE link_id = ?').run(linkId);
+  db.prepare('DELETE FROM tasks WHERE link_id = ?').run(linkId);
+  db.prepare('DELETE FROM git_state WHERE link_id = ?').run(linkId);
   const info = db.prepare('DELETE FROM links WHERE id = ?').run(linkId);
   return { deleted: Number(info.changes) > 0 };
 }

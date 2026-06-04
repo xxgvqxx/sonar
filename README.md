@@ -72,7 +72,7 @@ In **Codex**, there are no slash commands — ask it to "use the sonar skill to 
 
 ## How collaboration works: the shared doc
 
-Each link has a **shared markdown doc** at `~/.sonar/links/<id>/context.md` with sections **Context / Open questions / Answers / Decisions / Log**. It is the source of truth — agents and you read and append to it. `post`/`wait` are just lightweight "the doc changed" pings.
+Each link has a **shared markdown doc** at `~/.sonar/links/<id>/context.md` with sections **Participants / Tasks / Claims / Git / Context / Open questions / Answers / Decisions / Log**. It is the source of truth — agents and you read and append to it. `post`/`wait` are just lightweight "the doc changed" pings. (The **Tasks / Claims / Git** sections are kept in sync from the coordination tools below — see [Coordinating parallel work](#coordinating-parallel-work).)
 
 ```
 # Session A — create a link, write a briefing + a question
@@ -94,6 +94,22 @@ Why a doc instead of a chat? These agents are **turn‑based** — they only act
 For **instant** back‑and‑forth, both sessions must be active on the link at the same time (`/sonar <id>` on each). The `/sonar` command keeps each agent in a listen loop (`wait` → handle → report to you → repeat) and surfaces every update.
 
 **Token‑efficient reads.** The doc never re‑pays for its whole history on every glance. `doc_read` returns a **compact view** by default — every section, but the append‑only **Log** trimmed to its most recent entries — and the on‑disk Log auto‑rotates: older entries spill to `context.archive.md` so `context.md` stays bounded. Read a single section with `doc_read(section="…")` (e.g. `section="Log"` for the full live Log), or the entire document with `doc_read(full=true)`. Doc‑change pings stay terse (they say *what* changed, not a copy of the prose) so the message stream doesn't duplicate the doc. For a frontend⇄backend pair, the efficient pattern is to keep the shared **contract** (API shape / types) in a section you `doc_set_section` (replace, bounded) and use `post`/`wait` for "I changed X" change events.
+
+## Coordinating parallel work
+
+When two sessions edit the **same repo** at once, talking isn't enough — they can still clobber the same file, redo each other's work, or push onto a branch the other is behind on. Three coordination primitives close that gap. All three are pure data (safe for remote callers with a token — no code runs on the hub), and each renders into a doc section so a single `doc_read` shows the whole picture and the menu‑bar viewer displays it for free.
+
+- **Claims (leases) — don't clobber.** Before editing a shared file, `claim(resource="apps/web/api-client.ts", from="…")`. If the other session already holds an overlapping lease, the call returns the conflict (who holds it, until when) instead of acquiring — so you work elsewhere or coordinate. Overlap is **path‑aware**: claiming a directory covers the files under it. Leases **auto‑expire** (default 30 min, re‑claim to extend) so a vanished agent never deadlocks the repo; `release(...)` frees one early, and `steal=true` overrides a clearly stale one. Active leases live in the **Claims** section.
+- **Task board — split the work.** `task_add(title="…")` puts an item on a shared **todo/doing/done/blocked** board (surfaced in **Tasks**). `task_update(num=N, status="doing", assignee=you)` claims it; `status="done"` finishes it. Agents pull from the board instead of negotiating in prose.
+- **Git presence — stay aware.** `git_sync(from="…", branch=…, ahead=…, behind=…, changed=…, files=[…])` publishes your tree and returns what every other participant last reported, so the frontend dev sees "backend is on `feat/api` ↑2, just touched `shared/types.ts`." It's **agent‑reported** (the agent runs `git` locally and passes the numbers) so it works across machines, where the hub can't see a remote teammate's working tree. State lives in **Git**.
+
+```
+# A is about to refactor the API client; B is on the backend
+claim(link_id, resource="apps/web/api-client.ts", from="claude@feat/auth")     # A: locks the file
+task_add(link_id, title="Add /v2/orders endpoint", from="codex@main", assignee="codex@main")
+git_sync(link_id, from="codex@main", branch="feat/api", ahead=2, changed=1, files=["shared/types.ts"])
+# A's next doc_read shows the claim it holds, the open task, and that B just touched shared/types.ts
+```
 
 ## Dispatch a worker
 
@@ -193,6 +209,9 @@ sonar bar [fg]                 launch the macOS menu-bar app
 | `doc_read` | read the shared context doc; **compact by default** (Log trimmed to recent entries), `section="…"` for one section, `full=true` for everything |
 | `doc_append` | append to a section (Context / Open questions / Answers / Decisions) + ping |
 | `doc_set_section` | replace a whole section (cleanup / finalize) |
+| `claim` / `release` | lease a file/dir so the other session avoids clobbering it (path‑overlap aware, auto‑expiring, `steal=true` overrides a stale one); surfaces in the doc **Claims** |
+| `task_add` / `task_update` | shared todo/doing/done/blocked board (assignee + note); `task_update` claims (`status="doing"`) or finishes (`status="done"`); surfaces in the doc **Tasks** |
+| `git_sync` | report your branch / ahead‑behind / changed files and get the peers' back (agent‑reported, so it works cross‑machine); surfaces in the doc **Git** |
 | `spawn_worker` | launch a Claude/Codex worker in an isolated worktree, joined to the link (runs on the hub host; remote callers gated by `SONAR_ALLOW_REMOTE_EXEC`) |
 | `post` / `read` | send / read "doc changed" pings |
 | `wait` | long‑poll until the link changes (or timeout); per‑participant cursor so a loop blocks correctly |
@@ -265,7 +284,7 @@ sonar/
     cli.ts        CLI + daemon lifecycle + install
     server.ts     HTTP server: MCP (/mcp) + REST (/api/*)
     tools.ts      MCP tool definitions
-    core.ts       links, messages, long-poll waiters + read cursors
+    core.ts       links, messages, long-poll waiters + read cursors, claims/tasks/git-presence
     docs.ts       shared markdown doc read/append/section (compact + section reads, Log rotation→context.archive.md)
     spawn.ts      worker dispatch (git worktree + terminal/headless launch) + worker registry/status
     tmux.ts       launch sessions in tmux + wake a paused pane (send-keys, idle-gated)
