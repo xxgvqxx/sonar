@@ -186,6 +186,7 @@ sonar bar [fg]                 launch the macOS menu-bar app
 
 | tool | purpose |
 |------|---------|
+| `sonar_help` | capabilities directory — a decision map ("need X → call Y") + purpose/example per tool; call when unsure how to coordinate |
 | `link_create` | mint a link + shared doc, return a short ID |
 | `link_join` | join by ID; returns participants + the current shared doc |
 | `link_list` / `link_info` | discover / inspect links |

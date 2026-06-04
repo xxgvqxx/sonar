@@ -3,6 +3,7 @@
 Notable changes, newest first. Entries under **[Unreleased]** are auto-appended from commit subjects by `.githooks/post-commit` (enable in a clone with `git config core.hooksPath .githooks`); edit them freely and roll them under a version heading at release time.
 
 ## [Unreleased]
+- **2026-06-04** — Add sonar_help: a capabilities directory agents can look up
 - **2026-06-04** — Bound the shared doc: compact + section reads, Log rotation, terse pings
 - **2026-06-04** — Share one hub across machines: LAN bind + token auth + remote-exec guard
 - **2026-06-03** — Show a green/red connection light on each participant in the doc viewer

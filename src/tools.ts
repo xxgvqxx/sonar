@@ -58,10 +58,64 @@ const ident = {
   cwd: z.string().optional().describe('Working directory.'),
 };
 
+// ---------------------------------------------------------------------------
+// Self-describing capabilities directory (returned by the `sonar_help` tool).
+// A single lookup an agent can call to orient itself. Keep these two tables in
+// sync when tools change — they ARE the agent-facing decision guide.
+// ---------------------------------------------------------------------------
+const DECISION_MAP: [need: string, use: string][] = [
+  ['start collaborating with another session', 'link_create (share the ID) — or link_join if you were given a code'],
+  ['get an answer from another LIVE session', 'post() then wait() in a loop (re-read the doc on each ping)'],
+  ['catch up after a ping, or before you start working', 'doc_read (compact by default) — or read(since_seq=…) for just new messages'],
+  ['contribute context / ask a question / record an answer', 'doc_append(section="Context" | "Open questions" | "Answers")'],
+  ['record a decision, or keep a bounded contract (API shape, types)', 'doc_set_section (replace = stays bounded, no append bloat)'],
+  ['dispatch an autonomous subtask that reports back', 'spawn_worker(task=…)  — headless=true to run in the background'],
+  ['pull context from your OWN past Claude/Codex sessions', 'search_context(query=…, repo?/branch?/agent?)'],
+  ['discover what links or sessions already exist', 'link_list / link_info / recent_sessions'],
+];
+
+const TOOL_GUIDE: { name: string; purpose: string; example: string }[] = [
+  { name: 'link_create', purpose: 'mint a new link + shared doc; share the returned ID with the other session', example: 'link_create(label="claude@feat/auth", agent="claude", branch="feat/auth", cwd="…")' },
+  { name: 'link_join', purpose: 'join an existing link by ID; returns participants + the compact doc', example: 'link_join(link_id="k7m2", label="codex@main", agent="codex")' },
+  { name: 'link_list / link_info', purpose: 'discover links to join / inspect who is on one and recent activity', example: 'link_list()' },
+  { name: 'doc_read', purpose: 'read the shared doc — compact by default; section="…" for one section; full=true for everything', example: 'doc_read(link_id="k7m2", section="Open questions")' },
+  { name: 'doc_append', purpose: 'append to a section (Context / Open questions / Answers / Decisions) and ping waiters', example: 'doc_append(link_id="k7m2", section="Answers", from="claude@feat/auth", text="Q… → A…")' },
+  { name: 'doc_set_section', purpose: 'replace a whole section — use for current-state (Decisions, the API contract) so it stays bounded', example: 'doc_set_section(link_id="k7m2", section="Decisions", text="…")' },
+  { name: 'post', purpose: 'send a short "doc changed" / question ping to the other session; pair with wait', example: 'post(link_id="k7m2", from="claude@feat/auth", body="answered your Q in the doc")' },
+  { name: 'read', purpose: 'read messages since a seq WITHOUT blocking (quick catch-up)', example: 'read(link_id="k7m2", since_seq=12)' },
+  { name: 'wait', purpose: 'long-poll until a new message arrives (loop it); per-participant cursor advances automatically', example: 'wait(link_id="k7m2", from="claude@feat/auth")' },
+  { name: 'search_context', purpose: 'full-text search YOUR indexed Claude + Codex history; filter by repo / branch / agent', example: 'search_context(query="rate limiting", repo="api")' },
+  { name: 'recent_sessions', purpose: 'list recently indexed sessions to discover what context exists to search/link', example: 'recent_sessions(repo="api")' },
+  { name: 'spawn_worker', purpose: 'launch a new claude/codex session in an isolated git worktree, pre-joined to the link, to work a task and report back into the doc', example: 'spawn_worker(link_id="k7m2", task="investigate X and answer the open question", headless=true)' },
+];
+
 export function registerTools(server: McpServer, opts: { remoteAddr?: string } = {}) {
   // In LAN mode, host-mutating tools are refused for remote callers unless explicitly allowed.
   // (Local/loopback agents on the hub machine are always permitted; default loopback mode is unaffected.)
   const remoteExecBlocked = () => LAN_MODE && !isLoopbackAddr(opts.remoteAddr) && !process.env.SONAR_ALLOW_REMOTE_EXEC;
+
+  server.registerTool(
+    'sonar_help',
+    {
+      title: 'What can sonar do? (capabilities directory)',
+      description:
+        'Look up what sonar can do and which tool fits your situation. Returns a decision map ("if you need X → call Y") plus a one-line purpose + example for every sonar tool. Call this first if you are unsure how to coordinate with another Claude Code / Codex session.',
+      inputSchema: {},
+    },
+    async () => {
+      const map = DECISION_MAP.map(([need, use]) => `• if you need to ${need}\n    → ${use}`).join('\n');
+      const guide = TOOL_GUIDE.map((t) => `${t.name}\n  ${t.purpose}\n  e.g. ${t.example}`).join('\n\n');
+      return text(
+        `sonar coordinates multiple Claude Code / Codex sessions through a per-link SHARED MARKDOWN DOC (the source of truth both agents + the human read and edit). post/wait are just "the doc changed" pings.\n\n` +
+          `DECISION MAP\n${map}\n\n` +
+          `TOOLS\n${guide}\n\n` +
+          `NOTES\n` +
+          `• Typical flow: link_create / link_join → doc_read → doc_append your context → post a ping → wait() in a loop, re-reading the doc on each ping. Put substantive content in the DOC, not just in pings.\n` +
+          `• doc_read is compact by default (Log trimmed, older entries archived); pass section="Log" or full=true for more.\n` +
+          `• Re-prompting a PAUSED agent in place is an operator action (shell: "sonar wake <link> <label> [prompt]"), not an MCP tool — it needs the session to be running under tmux.`
+      );
+    }
+  );
 
   server.registerTool(
     'link_create',
