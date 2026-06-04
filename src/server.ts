@@ -1,7 +1,7 @@
 import express from 'express';
-import type { Request, Response } from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import fs from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -12,19 +12,62 @@ import * as docs from './docs.ts';
 import { spawnWorker, listWorktrees, pruneWorktree, listWorkers, stopWorker } from './spawn.ts';
 import { listPanes, wake } from './tmux.ts';
 import { startIndexer, reindexAll } from './indexer.ts';
-import { HOST, PORT, VERSION, PID_PATH } from './config.ts';
+import { HOST, PORT, VERSION, PID_PATH, getToken, isLoopbackAddr } from './config.ts';
 
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-function buildMcpServer(): McpServer {
+function buildMcpServer(remoteAddr?: string): McpServer {
   const server = new McpServer({ name: 'sonar', version: VERSION });
-  registerTools(server);
+  // Pass the connecting client's address so host-mutating tools (spawn_worker) can refuse remote
+  // callers in LAN mode — the in-process tool path doesn't otherwise see who is calling.
+  registerTools(server, { remoteAddr });
   return server;
+}
+
+/** Constant-time token compare (length-guarded so timingSafeEqual gets equal-length buffers). */
+function tokenMatches(supplied: string, expected: string): boolean {
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+/** Pull a bearer/X-Sonar-Token credential off the request, if present. */
+function suppliedToken(req: Request): string | undefined {
+  const auth = req.headers['authorization'];
+  if (typeof auth === 'string' && /^Bearer\s+/i.test(auth)) return auth.replace(/^Bearer\s+/i, '').trim();
+  const x = req.headers['x-sonar-token'];
+  if (typeof x === 'string' && x.length) return x.trim();
+  return undefined;
+}
+
+/**
+ * Guard for endpoints that run code / kill / mutate the host. Loopback callers always pass.
+ * Non-loopback callers are refused (403) unless SONAR_ALLOW_REMOTE_EXEC is truthy.
+ * Returns false (and sends 403) when the caller must be blocked.
+ */
+function requireLocalExec(req: Request, res: Response): boolean {
+  if (isLoopbackAddr(req.socket.remoteAddress) || process.env.SONAR_ALLOW_REMOTE_EXEC) return true;
+  res.status(403).json({ error: 'remote exec disabled: this endpoint runs code on the hub host. Set SONAR_ALLOW_REMOTE_EXEC=1 to permit.' });
+  return false;
 }
 
 export function startServer() {
   const app = express();
   app.use(express.json({ limit: '8mb' }));
+
+  // ---- auth (covers /mcp and /api, NOT /health) -------------------------------
+  // No token configured → allow everything (preserves the loopback-only, no-auth default).
+  // Token configured → loopback callers are exempt (local CLI + menu bar stay frictionless);
+  // remote callers must present the token via Authorization: Bearer or X-Sonar-Token.
+  app.use(['/mcp', '/api'], (req: Request, res: Response, next: NextFunction) => {
+    const token = getToken();
+    if (!token) return next();
+    if (isLoopbackAddr(req.socket.remoteAddress)) return next();
+    const given = suppliedToken(req);
+    if (given && tokenMatches(given, token)) return next();
+    res.status(401).json({ error: 'unauthorized: set SONAR_TOKEN / Authorization: Bearer <token>' });
+  });
 
   // ---- MCP (Streamable HTTP) — one server connection per client session ----
   app.post('/mcp', async (req: Request, res: Response) => {
@@ -42,7 +85,7 @@ export function startServer() {
       transport.onclose = () => {
         if (transport.sessionId) delete transports[transport.sessionId];
       };
-      await buildMcpServer().connect(transport);
+      await buildMcpServer(req.socket.remoteAddress).connect(transport);
     } else {
       res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: no valid session ID' }, id: null });
       return;
@@ -166,6 +209,7 @@ export function startServer() {
   app.post(
     '/api/sessions/kill',
     wrap(async (req, res) => {
+      if (!requireLocalExec(req, res)) return;
       const b = req.body || {};
       if (!b.pid) return res.status(400).json({ error: 'pid required' });
       res.json(await sessions.killSession(Number(b.pid), b.signal));
@@ -209,6 +253,7 @@ export function startServer() {
   app.post(
     '/api/links/:id/spawn',
     wrap(async (req, res) => {
+      if (!requireLocalExec(req, res)) return;
       const b = req.body || {};
       if (!core.linkExists(req.params.id)) return res.status(404).json({ error: 'no such link' });
       res.json(await spawnWorker({ linkId: req.params.id, task: b.task || 'collaborate on the shared doc', agent: b.agent, cwd: b.cwd, headless: b.headless, dryRun: b.dryRun }));
@@ -230,7 +275,10 @@ export function startServer() {
 
   app.post(
     '/api/workers/:id/stop',
-    wrap(async (req, res) => res.json(await stopWorker(req.params.id)))
+    wrap(async (req, res) => {
+      if (!requireLocalExec(req, res)) return;
+      res.json(await stopWorker(req.params.id));
+    })
   );
 
   // ---- live panes (tmux) + waking a paused agent by typing into its pane ----
@@ -242,6 +290,7 @@ export function startServer() {
   app.post(
     '/api/wake',
     wrap(async (req, res) => {
+      if (!requireLocalExec(req, res)) return;
       const b = req.body || {};
       if (!b.link_id || !b.label) return res.status(400).json({ ok: false, error: 'link_id and label required' });
       const r = await wake({ linkId: b.link_id, label: b.label, message: b.message, force: b.force });
@@ -263,7 +312,10 @@ export function startServer() {
 
   app.delete(
     '/api/worktrees/:name',
-    wrap(async (req, res) => res.json(await pruneWorktree(req.params.name)))
+    wrap(async (req, res) => {
+      if (!requireLocalExec(req, res)) return;
+      res.json(await pruneWorktree(req.params.name));
+    })
   );
 
   const server = app.listen(PORT, HOST, () => {

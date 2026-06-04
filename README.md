@@ -162,6 +162,7 @@ sonar install                  wire up Claude Code + Codex + session-init, start
 sonar start | stop | status    manage the background hub
 sonar daemon                   run the hub in the foreground
 sonar port <N|auto>            change the hub port (re-registers with Claude/Codex); "auto" picks a free one
+sonar invite                   print the LAN URL + token + paste-ready setup for a teammate on the same network
 
 sonar doc <id> [--open]        print / open a link's shared context doc
 sonar spawn <id> [claude|codex] <task…> [--headless]   dispatch a worker on a link
@@ -205,10 +206,26 @@ Environment variables (set before `sonar start`):
 | `SONAR_DIR` | `~/.sonar` | data directory (db, pid, logs, links, worktrees) |
 | `SONAR_INDEX_DAYS` | `45` | only index transcripts modified within this many days |
 | `SONAR_INDEX_POLL_MS` | `4000` | how often transcripts are rescanned |
+| `SONAR_HOST` | `127.0.0.1` | bind address; set `0.0.0.0` to expose on the LAN |
+| `SONAR_TOKEN` | _(none)_ | shared access token required of remote callers (also read from `config.json`) |
+| `SONAR_ALLOW_REMOTE_EXEC` | _(off)_ | permit code‑exec endpoints/tools for remote callers (off by default) |
 
 **Port resolution:** `SONAR_PORT` env → `~/.sonar/config.json` (written by `sonar port`) → `7610`. If the port is taken, `sonar install` automatically falls back to the next free one, and `sonar start` points you to `sonar port auto`. Changing the port **re-registers the MCP URL** with Claude Code and Codex and the menu bar follows it automatically — so it stays consistent everywhere.
 
 Menu‑bar settings live in `~/.sonar/menubar.json` (terminal, agents, active window, recent count, icon).
+
+### Running on a shared network (LAN)
+
+By default the hub is loopback‑only (single machine). To let two people on the **same network** — say a frontend dev and a backend dev — point their agents at **one shared hub**, run the hub on one machine bound to the LAN:
+
+```bash
+SONAR_HOST=0.0.0.0 sonar start     # auto-generates + persists a shared token, prints it
+sonar invite                       # prints the LAN URL, token, and paste-ready Claude/Codex setup
+```
+
+The other machine registers that URL with the token (the `invite` output gives the exact command). Then both sessions `link_join` the same ID and collaborate through the shared doc / messages exactly as on one machine — the store‑and‑forward model (durable SQLite + per‑participant cursors + long‑poll) already makes this async, so neither side has to be live at the same instant.
+
+**Auth model:** with no token configured the hub stays loopback‑only and unauthenticated (unchanged). Once a token exists, **loopback callers are exempt** (the local CLI / menu bar keep working with zero friction) and **remote callers must present** `Authorization: Bearer <token>` (or `X-Sonar-Token`). The **code‑exec surface** — `spawn_worker` and the spawn/kill/wake/worktree‑delete endpoints, which run processes on the *hub* machine — is refused for remote callers even with a valid token, unless you opt in with `SONAR_ALLOW_REMOTE_EXEC=1`. Local agents on the hub machine can always spawn.
 
 ## How it works
 
@@ -221,7 +238,8 @@ Menu‑bar settings live in `~/.sonar/menubar.json` (terminal, agents, active wi
 - **Turn‑based agents.** Instant back‑and‑forth needs both sessions live at once; otherwise the shared doc holds everything for whenever the other side is next active. Spawned workers are the autonomous path, and `sonar wake` (tmux) can re‑prompt a paused session in place — but only sessions launched under tmux are wake‑able; a bare Ghostty pane can't be injected into.
 - **Codex branch tagging.** Codex transcripts record `cwd` but not the git branch — branch filtering in search is exact only for Claude sessions.
 - **Indexing window.** Only the last `SONAR_INDEX_DAYS` of transcripts are indexed; the first run backfills in the background.
-- **Local only.** Binds `127.0.0.1` with no auth — don't expose the port.
+- **Loopback by default; opt‑in LAN.** Binds `127.0.0.1` with no auth out of the box. To share a hub across machines on a trusted network, set `SONAR_HOST=0.0.0.0` (which requires a token for remote callers — see [Running on a shared network](#running-on-a-shared-network-lan)). The token keeps strangers off the wifi out; it does not isolate trusted teammates from each other. Don't expose the hub on an untrusted network.
+- **Workers run on the hub host.** `spawn_worker` / `wake` manipulate processes and git worktrees on the machine the hub runs on — so a remote teammate can't spawn a worker onto *their* machine (it lands on the hub's), and remote exec stays gated behind `SONAR_ALLOW_REMOTE_EXEC`.
 - **Headless worker mode** (`--headless`) relies on auto‑approving tools in the worker's isolated worktree; the interactive (visible terminal) path is the tested default.
 
 ## Changelog

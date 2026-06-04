@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as core from './core.ts';
 import * as docs from './docs.ts';
 import { spawnWorker } from './spawn.ts';
+import { LAN_MODE, isLoopbackAddr } from './config.ts';
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
 
@@ -57,7 +58,11 @@ const ident = {
   cwd: z.string().optional().describe('Working directory.'),
 };
 
-export function registerTools(server: McpServer) {
+export function registerTools(server: McpServer, opts: { remoteAddr?: string } = {}) {
+  // In LAN mode, host-mutating tools are refused for remote callers unless explicitly allowed.
+  // (Local/loopback agents on the hub machine are always permitted; default loopback mode is unaffected.)
+  const remoteExecBlocked = () => LAN_MODE && !isLoopbackAddr(opts.remoteAddr) && !process.env.SONAR_ALLOW_REMOTE_EXEC;
+
   server.registerTool(
     'link_create',
     {
@@ -331,6 +336,12 @@ export function registerTools(server: McpServer) {
     },
     async (a) => {
       if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
+      if (remoteExecBlocked()) {
+        return text(
+          'spawn_worker is disabled for remote callers while the hub is exposed on the LAN — it runs code on the hub host. ' +
+            'The hub operator can set SONAR_ALLOW_REMOTE_EXEC=1 to allow it.'
+        );
+      }
       try {
         const r = await spawnWorker({ linkId: a.link_id, task: a.task, agent: a.agent, cwd: a.cwd, headless: a.headless });
         return text(

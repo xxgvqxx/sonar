@@ -3,8 +3,9 @@ import path from 'node:path';
 import os from 'node:os';
 import net from 'node:net';
 import { spawn, execFileSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { BASE_URL, MCP_URL, PID_PATH, LOG_PATH, DATA_DIR, PORT, HOST, VERSION, CONFIG_FILE, urlFor } from './config.ts';
+import { BASE_URL, MCP_URL, PID_PATH, LOG_PATH, DATA_DIR, PORT, HOST, VERSION, CONFIG_FILE, urlFor, LAN_MODE, getToken, setToken } from './config.ts';
 
 const SELF = fileURLToPath(import.meta.url);
 
@@ -24,7 +25,8 @@ async function findFreePort(from: number): Promise<number> {
   throw new Error(`no free port found near ${from}`);
 }
 
-function writePortConfig(port: number) {
+/** Merge a patch into ~/.sonar/config.json, preserving existing fields (e.g. port + token). */
+function writeConfig(patch: Record<string, unknown>) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   let cfg: any = {};
   try {
@@ -32,8 +34,12 @@ function writePortConfig(port: number) {
   } catch {
     /* new file */
   }
-  cfg.port = port;
+  Object.assign(cfg, patch);
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+}
+
+function writePortConfig(port: number) {
+  writeConfig({ port });
 }
 
 function isRunning(): number | null {
@@ -47,9 +53,15 @@ function isRunning(): number | null {
 }
 
 async function api(method: string, route: string, body?: any): Promise<any> {
+  // Attach the token when configured. BASE_URL is loopback (the local hub exempts loopback
+  // callers anyway), but this is correct + needed if SONAR_TOKEN points the CLI at a remote hub.
+  const headers: Record<string, string> = {};
+  if (body) headers['content-type'] = 'application/json';
+  const token = getToken();
+  if (token) headers['authorization'] = `Bearer ${token}`;
   const res = await fetch(`${BASE_URL}${route}`, {
     method,
-    headers: body ? { 'content-type': 'application/json' } : undefined,
+    headers: Object.keys(headers).length ? headers : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
@@ -69,12 +81,36 @@ function gitBranch(): string | undefined {
   }
 }
 
+/** First non-internal IPv4 of this machine — what a teammate on the LAN would dial. */
+function lanIp(): string | undefined {
+  for (const ifaces of Object.values(os.networkInterfaces())) {
+    for (const ni of ifaces ?? []) {
+      if (ni.family === 'IPv4' && !ni.internal) return ni.address;
+    }
+  }
+  return undefined;
+}
+
 // --------------------------------------------------------------------------
 // daemon lifecycle
 // --------------------------------------------------------------------------
 async function cmdDaemon() {
   const { startServer } = await import('./server.ts');
   fs.mkdirSync(DATA_DIR, { recursive: true });
+  // Going LAN with no token? Generate a URL-safe one, persist it (merged with port), and hand it
+  // to the live server via setToken so its auth middleware sees it. Log it so the operator can share.
+  if (LAN_MODE) {
+    let token = getToken();
+    if (!token) {
+      token = randomBytes(18).toString('base64url');
+      writeConfig({ token });
+      setToken(token);
+      console.log(`sonar: LAN mode — generated shared token: ${token}`);
+    } else {
+      console.log(`sonar: LAN mode — using configured token: ${token}`);
+    }
+    console.log(`sonar: teammates connect with  Authorization: Bearer ${token}  — run "sonar invite" for the full command.`);
+  }
   fs.writeFileSync(PID_PATH, String(process.pid));
   const shutdown = () => {
     try {
@@ -136,9 +172,52 @@ async function cmdStatus() {
     console.log(`sonar: running (pid ${pid}) on ${BASE_URL}`);
     console.log(`  links=${h.links} messages=${h.messages} indexed_turns=${h.indexed_turns} indexed_files=${h.indexed_files}`);
     console.log(`  MCP endpoint: ${MCP_URL}`);
+    if (LAN_MODE) {
+      const ip = lanIp();
+      if (ip) console.log(`  LAN MCP endpoint: http://${ip}:${PORT}/mcp  (run "sonar invite" for teammate setup)`);
+    }
   } catch {
     console.log(`sonar: pid ${pid} alive but not responding on ${BASE_URL} yet (give the indexer a moment).`);
   }
+}
+
+// Print everything a teammate on another machine needs to point their Claude/Codex at this hub.
+function cmdInvite() {
+  const ip = lanIp();
+  const token = getToken();
+  if (!ip) {
+    console.log('sonar invite: could not find a non-internal IPv4 address for this machine.');
+    console.log('  Are you on a network? Otherwise teammates cannot reach this hub.');
+  }
+  const url = `http://${ip ?? '<this-machine-lan-ip>'}:${PORT}/mcp`;
+
+  console.log('Invite a teammate to this sonar hub\n');
+  console.log(`  MCP URL:  ${url}`);
+  console.log(`  Token:    ${token ?? '(none configured)'}\n`);
+
+  if (!LAN_MODE) {
+    console.log('! The hub is currently bound to loopback only — teammates cannot reach it yet.');
+    console.log('  Restart it on the LAN:  SONAR_HOST=0.0.0.0 sonar start');
+    console.log('  (that auto-generates a shared token; or set SONAR_TOKEN yourself before starting)');
+    console.log('  Remote code-exec endpoints stay disabled unless you also set SONAR_ALLOW_REMOTE_EXEC=1.\n');
+  }
+  if (!token) {
+    console.log('! No token configured. Start the hub with SONAR_HOST=0.0.0.0 (generates one) or set SONAR_TOKEN.\n');
+  }
+
+  const tok = token ?? '<token>';
+  console.log('Claude Code (run on the teammate\'s machine):');
+  console.log(`  claude mcp add --transport http --scope user sonar ${url} --header "Authorization: Bearer ${tok}"\n`);
+
+  console.log('Codex — add to ~/.codex/config.toml:');
+  console.log('  [mcp_servers.sonar]');
+  console.log(`  url = "${url}"`);
+  console.log('  # Codex must send the bearer token on every request. If your Codex build supports an');
+  console.log('  # http_headers / bearer_token field for [mcp_servers.*], set it to the token above;');
+  console.log(`  # otherwise add an "Authorization: Bearer ${tok}" header however your Codex version configures HTTP MCP headers.`);
+  console.log('  # (Streamable-HTTP MCP also needs  rmcp_client = true  under [features].)\n');
+
+  console.log('Reminder: the hub host must be bound to the LAN (SONAR_HOST=0.0.0.0) for any of this to be reachable.');
 }
 
 // --------------------------------------------------------------------------
@@ -559,6 +638,7 @@ function cmdHelp() {
 Daemon:
   sonar install        register MCP with Claude Code & Codex, install /sonar, start hub
   sonar start|stop|status
+  sonar invite         print LAN URL + token + paste-ready setup for a teammate on the same network
   sonar daemon         run the hub in the foreground
   sonar port <N|auto>  change the hub port (re-registers with Claude/Codex); "auto" picks a free one
 
@@ -581,7 +661,9 @@ Menu bar app:
   sonar bar fg         run it in the foreground (to see errors)
 
 Hub: ${BASE_URL}   MCP: ${MCP_URL}
-Configure with env: SONAR_PORT (${PORT}), SONAR_DIR, SONAR_INDEX_DAYS.`);
+Configure with env: SONAR_PORT (${PORT}), SONAR_DIR, SONAR_INDEX_DAYS,
+  SONAR_HOST (bind addr; 0.0.0.0 to expose on the LAN), SONAR_TOKEN (shared access token for remote callers),
+  SONAR_ALLOW_REMOTE_EXEC (permit code-exec endpoints for remote callers — off by default).`);
 }
 
 // --------------------------------------------------------------------------
@@ -596,6 +678,8 @@ const run = async () => {
       return cmdStop();
     case 'status':
       return cmdStatus();
+    case 'invite':
+      return cmdInvite();
     case 'install':
       return cmdInstall();
     case 'create':

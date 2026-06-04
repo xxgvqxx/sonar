@@ -12,7 +12,13 @@ export const LOG_PATH = path.join(DATA_DIR, 'daemon.log');
 /** Persisted runtime config (currently just the chosen port) — source of truth across hub/CLI/menu bar. */
 export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
-export const HOST = '127.0.0.1';
+/** Bind address: SONAR_HOST env > loopback. Set SONAR_HOST=0.0.0.0 to expose on the LAN. */
+export const HOST = process.env.SONAR_HOST || '127.0.0.1';
+/** Address LOCAL clients (this machine's CLI / menu bar / Claude registration) dial. When HOST is a
+ *  LAN bind like 0.0.0.0, local clients still reach the hub over loopback (0.0.0.0 includes it), and
+ *  0.0.0.0 is not a valid *connect* target — so local URLs always use loopback. Remote teammates use
+ *  the machine's LAN IP instead (see `sonar invite`). */
+export const LOCAL_HOST = HOST === '127.0.0.1' || HOST === '::1' || HOST === 'localhost' ? HOST : '127.0.0.1';
 export const DEFAULT_PORT = 7610;
 
 function persistedPort(): number | undefined {
@@ -24,11 +30,50 @@ function persistedPort(): number | undefined {
   }
 }
 
+function persistedToken(): string | undefined {
+  try {
+    const t = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')).token;
+    return typeof t === 'string' && t.length ? t : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Resolve the port: SONAR_PORT env > ~/.sonar/config.json > default. */
 export const PORT = Number(process.env.SONAR_PORT) || persistedPort() || DEFAULT_PORT;
-export const urlFor = (port: number) => `http://${HOST}:${port}/mcp`;
-export const BASE_URL = `http://${HOST}:${PORT}`;
+// urlFor/BASE_URL/MCP_URL are for LOCAL display + registration, so they use LOCAL_HOST (loopback) —
+// the bundled CLI / menu bar / local Claude registration always talk to the hub on this machine.
+// (The server still BINDS to HOST; only the *connect* URLs are loopback.)
+export const urlFor = (port: number) => `http://${LOCAL_HOST}:${port}/mcp`;
+export const BASE_URL = `http://${LOCAL_HOST}:${PORT}`;
 export const MCP_URL = `${BASE_URL}/mcp`;
+
+/** True for a hostname that means "this machine only" (loopback). */
+export function isLoopbackHost(h: string): boolean {
+  return h === '127.0.0.1' || h === '::1' || h === 'localhost';
+}
+
+/** True for a socket remote address that is loopback — handles the IPv4-mapped IPv6 form too. */
+export function isLoopbackAddr(addr?: string): boolean {
+  if (!addr) return false;
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1' || addr === 'localhost';
+}
+
+/** When HOST is non-loopback the hub is reachable from other machines, so auth applies. */
+export const LAN_MODE = !isLoopbackHost(HOST);
+
+/**
+ * Shared access token: SONAR_TOKEN env > `token` in ~/.sonar/config.json > none.
+ * Mutable so the daemon can generate + install one at boot in LAN mode (see setToken).
+ * Read it LIVE via getToken() — never capture it as a const at module load.
+ */
+export let TOKEN: string | undefined = process.env.SONAR_TOKEN || persistedToken() || undefined;
+export function getToken(): string | undefined {
+  return TOKEN;
+}
+export function setToken(t: string): void {
+  TOKEN = t;
+}
 
 export const VERSION = '0.1.0';
 
