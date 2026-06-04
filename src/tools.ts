@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as core from './core.ts';
 import * as docs from './docs.ts';
 import { spawnWorker } from './spawn.ts';
+import { runHook } from './hooks.ts';
 import { LAN_MODE, isLoopbackAddr, allowRemoteExec } from './config.ts';
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
@@ -56,14 +57,31 @@ function syncClaims(linkId: string) {
 }
 
 const TASK_BADGE: Record<string, string> = { todo: '☐', doing: '▶', done: '✓', blocked: '⛔' };
+function parseDeps(raw: unknown): number[] {
+  if (!raw || typeof raw !== 'string') return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((n) => Number.isInteger(n) && n > 0) : [];
+  } catch {
+    return [];
+  }
+}
 function syncTasks(linkId: string) {
   const rows = core.listTasks({ linkId });
+  const done = new Set(rows.filter((t) => t.status === 'done').map((t) => t.num));
   const body = rows.length
     ? rows
-        .map(
-          (t) =>
-            `- ${TASK_BADGE[t.status] ?? '·'} **#${t.num}** ${t.title} — ${t.status} · ${t.assignee || 'unassigned'}${t.note ? `\n    ${t.note}` : ''}`
-        )
+        .map((t) => {
+          const deps = parseDeps(t.deps);
+          const pending = deps.filter((d) => !done.has(d));
+          // Show what a blocked task is waiting on; otherwise just list its deps.
+          const depStr = deps.length
+            ? t.status === 'blocked' && pending.length
+              ? ` · blocked on ${pending.map((n) => '#' + n).join(', ')}`
+              : ` · deps ${deps.map((n) => '#' + n).join(', ')}`
+            : '';
+          return `- ${TASK_BADGE[t.status] ?? '·'} **#${t.num}** ${t.title} — ${t.status} · ${t.assignee || 'unassigned'}${depStr}${t.note ? `\n    ${t.note}` : ''}`;
+        })
         .join('\n')
     : '_(no tasks yet)_';
   docs.setSection(linkId, 'Tasks', body);
@@ -126,6 +144,7 @@ const DECISION_MAP: [need: string, use: string][] = [
   ['record a decision, or keep a bounded contract (API shape, types)', 'doc_set_section (replace = stays bounded, no append bloat)'],
   ['avoid clobbering a file the other session may also edit', 'claim(resource="path", from=…) BEFORE you edit it — release() when done'],
   ['split the work and track who is doing what', 'task_add then task_update(status="doing"|"done", assignee=you) — board shows in the doc "Tasks"'],
+  ['order work so one task waits for another', 'task_add(depends_on=[#…]) — it starts blocked and auto-unblocks when those are done'],
   ["see the other session's branch / ahead-behind / changed files", 'git_sync(from=…, branch=…, ahead=…, behind=…, changed=…, files=[…])'],
   ['dispatch an autonomous subtask that reports back', 'spawn_worker(task=…)  — headless=true to run in the background'],
   ['pull context from your OWN past Claude/Codex sessions', 'search_context(query=…, repo?/branch?/agent?)'],
@@ -140,7 +159,7 @@ const TOOL_GUIDE: { name: string; purpose: string; example: string }[] = [
   { name: 'doc_append', purpose: 'append to a section (Context / Open questions / Answers / Decisions) and ping waiters', example: 'doc_append(link_id="k7m2", section="Answers", from="claude@feat/auth", text="Q… → A…")' },
   { name: 'doc_set_section', purpose: 'replace a whole section — use for current-state (Decisions, the API contract) so it stays bounded', example: 'doc_set_section(link_id="k7m2", section="Decisions", text="…")' },
   { name: 'claim / release', purpose: 'lease a file/dir so the peer avoids clobbering you (path-overlap aware, auto-expiring; steal=true overrides a stale one). Shows in the doc "Claims"', example: 'claim(link_id="k7m2", resource="apps/web/api-client.ts", from="claude@feat/auth")' },
-  { name: 'task_add / task_update', purpose: 'shared todo/doing/done board (shows in the doc "Tasks"); task_update to claim (status="doing", assignee=you) or finish (status="done")', example: 'task_update(link_id="k7m2", num=2, from="codex@main", status="doing", assignee="codex@main")' },
+  { name: 'task_add / task_update', purpose: 'shared todo/doing/done board (in the doc "Tasks"); task_update to claim (status="doing", assignee=you) or finish (status="done"). task_add(depends_on=[#…]) makes a task wait — it auto-unblocks when its deps are done', example: 'task_add(link_id="k7m2", from="codex@main", title="Deploy", depends_on=[1,2])' },
   { name: 'git_sync', purpose: "report your branch / ahead-behind / changed files and get the peers' back — frontend⇄backend awareness. Shows in the doc \"Git\"", example: 'git_sync(link_id="k7m2", from="claude@feat/auth", branch="feat/auth", ahead=2, changed=3, files=["shared/types.ts"])' },
   { name: 'post', purpose: 'send a short "doc changed" / question ping to the other session; pair with wait', example: 'post(link_id="k7m2", from="claude@feat/auth", body="answered your Q in the doc")' },
   { name: 'read', purpose: 'read messages since a seq WITHOUT blocking (quick catch-up)', example: 'read(link_id="k7m2", since_seq=12)' },
@@ -173,6 +192,8 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
           `NOTES\n` +
           `• Typical flow: link_create / link_join → doc_read → doc_append your context → post a ping → wait() in a loop, re-reading the doc on each ping. Put substantive content in the DOC, not just in pings.\n` +
           `• Coordination state lives in the doc too: claim/release → "Claims" section, task_add/task_update → "Tasks", git_sync → "Git". So a single doc_read shows who holds which files, the task board, and each side's git state. Before editing a shared file, claim() it; before picking up work, read the Tasks section.\n` +
+          `• Tasks can depend on others: a task with unfinished deps is "blocked" and refuses doing/done until they complete; finishing a task auto-unblocks anything waiting only on it.\n` +
+          `• Enforcement you may hit: marking a task "done" can trigger an operator quality-gate (e.g. a test run) — if it fails you'll get the output back, so fix and retry. And if the operator installed the claim guard, a "git commit" touching a file another participant has claimed is blocked until you coordinate or they release it.\n` +
           `• doc_read is compact by default (Log trimmed, older entries archived); pass section="Log" or full=true for more.\n` +
           `• Re-prompting a PAUSED agent in place is an operator action (shell: "sonar wake <link> <label> [prompt]"), not an MCP tool — it needs the session to be running under tmux.`
       );
@@ -514,23 +535,35 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
     {
       title: 'Add a task to the shared board',
       description:
-        'Add a task to the link\'s shared task board (status starts at "todo"). The board surfaces in the doc under "Tasks". Use it to split work between sessions and track who owns what; the returned number (#N) is how you update it later.',
+        'Add a task to the link\'s shared task board (status starts at "todo"). The board surfaces in the doc under "Tasks". Use it to split work between sessions and track who owns what; the returned number (#N) is how you update it later. ' +
+        'Pass depends_on=[#…] to make this task wait on others — it starts "blocked" and auto-unblocks to "todo" once they are all "done".',
       inputSchema: {
         link_id: z.string(),
         title: z.string().describe('Short task description.'),
         from: z.string().describe('Your participant label (recorded as creator).'),
         assignee: z.string().optional().describe('Who should own it (a participant label), if known.'),
         note: z.string().optional(),
+        depends_on: z.array(z.number()).optional().describe('Task numbers this one depends on; it stays "blocked" until they are all done.'),
       },
     },
     async (a) => {
       if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
-      const t = core.createTask({ linkId: a.link_id, title: a.title, assignee: a.assignee, note: a.note, by: a.from });
+      // Quality gate: an operator-configured task_created hook can reject the task (exit non-zero).
+      const gate = await runHook('task_created', { link: a.link_id, from: a.from, title: a.title });
+      if (gate.ran && !gate.allowed) return text(`🚫 task_created hook rejected this task:\n${gate.output || '(no output)'}`);
+      let t: any;
+      try {
+        t = core.createTask({ linkId: a.link_id, title: a.title, assignee: a.assignee, note: a.note, by: a.from, deps: a.depends_on });
+      } catch (e) {
+        return text((e as Error).message);
+      }
       syncTasks(a.link_id);
-      core.postMessage({ linkId: a.link_id, from: a.from, body: `🆕 task #${t.num}: ${t.title}${t.assignee ? ` → ${t.assignee}` : ''}` });
+      core.postMessage({ linkId: a.link_id, from: a.from, body: `🆕 task #${t.num}: ${t.title}${t.assignee ? ` → ${t.assignee}` : ''}${t.status === 'blocked' ? ' (blocked)' : ''}` });
       return text(
         `Added task #${t.num} "${t.title}" (${t.status}${t.assignee ? `, → ${t.assignee}` : ''}).\n` +
-          `Claim/progress it with task_update(link_id="${a.link_id}", num=${t.num}, from="${a.from}", status="doing", assignee="${a.from}"); finish with status="done".` +
+          (t.status === 'blocked'
+            ? `It depends on ${a.depends_on?.map((n) => '#' + n).join(', ')} and will auto-unblock when those are done.`
+            : `Claim/progress it with task_update(link_id="${a.link_id}", num=${t.num}, from="${a.from}", status="doing", assignee="${a.from}"); finish with status="done".`) +
           pending(a.link_id, a.from)
       );
     }
@@ -541,7 +574,8 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
     {
       title: 'Update a task (claim / progress / done)',
       description:
-        'Change a task\'s status (todo → doing → done, or blocked), claim it by setting assignee to yourself, and/or add a note. This is how you "claim" a task (status="doing", assignee=you) and mark it "done". Pings the link.',
+        'Change a task\'s status (todo → doing → done, or blocked), claim it by setting assignee to yourself, add a note, or change its dependencies. This is how you "claim" a task (status="doing", assignee=you) and mark it "done". ' +
+        'A task with unfinished dependencies cannot move to "doing"/"done"; marking a task "done" auto-unblocks anything waiting only on it. Pings the link.',
       inputSchema: {
         link_id: z.string(),
         num: z.number().describe('The task number (#N) shown on the board.'),
@@ -549,19 +583,37 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
         status: z.enum(['todo', 'doing', 'done', 'blocked']).optional(),
         assignee: z.string().optional().describe('Set the owner (use your own label to claim it).'),
         note: z.string().optional(),
+        depends_on: z.array(z.number()).optional().describe('Replace this task\'s dependency list (task numbers).'),
       },
     },
     async (a) => {
       if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
-      let t: any;
+      // Cheap dependency pre-check before the (possibly slow) completion gate, so we don't run a
+      // test suite only to reject the transition for unfinished deps.
+      if (a.status === 'doing' || a.status === 'done') {
+        const pending2 = core.unresolvedDeps(a.link_id, a.num);
+        if (pending2.length) return text(`⛔ task #${a.num} is blocked by unfinished ${pending2.map((n) => '#' + n).join(', ')} — finish those first.`);
+      }
+      // Quality gate: an operator-configured task_completed hook can block marking a task done.
+      if (a.status === 'done') {
+        const gate = await runHook('task_completed', { link: a.link_id, from: a.from, num: a.num, title: core.getTask(a.link_id, a.num)?.title });
+        if (gate.ran && !gate.allowed) return text(`🚫 task_completed hook blocked marking #${a.num} done:\n${gate.output || '(no output)'}`);
+      }
+      let r: { task: any; unblocked: number[] };
       try {
-        t = core.updateTask({ linkId: a.link_id, num: a.num, status: a.status, assignee: a.assignee, note: a.note });
+        r = core.updateTask({ linkId: a.link_id, num: a.num, status: a.status, assignee: a.assignee, note: a.note, deps: a.depends_on });
       } catch (e) {
         return text((e as Error).message);
       }
+      const t = r.task;
       syncTasks(a.link_id);
       core.postMessage({ linkId: a.link_id, from: a.from, body: `📌 task #${t.num} → ${t.status}${t.assignee ? ` (${t.assignee})` : ''}` });
-      return text(`Task #${t.num} "${t.title}" is now ${t.status}${t.assignee ? ` · ${t.assignee}` : ''}.` + pending(a.link_id, a.from));
+      if (r.unblocked.length) core.postMessage({ linkId: a.link_id, from: a.from, body: `🟢 unblocked ${r.unblocked.map((n) => '#' + n).join(', ')} (deps done)` });
+      return text(
+        `Task #${t.num} "${t.title}" is now ${t.status}${t.assignee ? ` · ${t.assignee}` : ''}.` +
+          (r.unblocked.length ? ` Unblocked ${r.unblocked.map((n) => '#' + n).join(', ')}.` : '') +
+          pending(a.link_id, a.from)
+      );
     }
   );
 

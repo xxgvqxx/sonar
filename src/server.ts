@@ -271,6 +271,25 @@ export function startServer() {
     })
   );
 
+  // ---- claims (read-only; powers `sonar guard` pre-commit enforcement) ----
+  app.get(
+    '/api/links/:id/claims',
+    wrap((req, res) => {
+      if (!core.linkExists(req.params.id)) return res.status(404).json({ error: 'no such link' });
+      res.json(core.listClaims(req.params.id));
+    })
+  );
+
+  app.post(
+    '/api/links/:id/claims/check',
+    wrap((req, res) => {
+      if (!core.linkExists(req.params.id)) return res.status(404).json({ error: 'no such link' });
+      const b = req.body || {};
+      const paths = Array.isArray(b.paths) ? b.paths.map(String) : [];
+      res.json({ conflicts: core.checkClaimConflicts({ linkId: req.params.id, holder: b.holder, paths }) });
+    })
+  );
+
   app.post(
     '/api/reindex',
     wrap((req, res) => {

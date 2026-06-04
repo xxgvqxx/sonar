@@ -70,7 +70,8 @@ db.exec(`
     note        TEXT,
     created_by  TEXT,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    deps        TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_tasks_link ON tasks (link_id, num);
 
@@ -119,3 +120,14 @@ db.exec(`
     tokenize = 'porter unicode61'
   );
 `);
+
+// Idempotent migrations for columns added after a table first shipped (CREATE TABLE IF NOT
+// EXISTS won't alter an existing table). Each ALTER throws "duplicate column" once applied —
+// swallow that so startup stays clean on an already-migrated db.
+for (const stmt of ['ALTER TABLE tasks ADD COLUMN deps TEXT']) {
+  try {
+    db.exec(stmt);
+  } catch {
+    /* column already present */
+  }
+}

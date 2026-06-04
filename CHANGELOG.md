@@ -3,6 +3,7 @@
 Notable changes, newest first. Entries under **[Unreleased]** are auto-appended from commit subjects by `.githooks/post-commit` (enable in a clone with `git config core.hooksPath .githooks`); edit them freely and roll them under a version heading at release time.
 
 ## [Unreleased]
+- **2026-06-04** — Add claim enforcement, task dependencies, and quality-gate hooks
 - **2026-06-04** — Cancel a long-poll waiter when its client disconnects
 - **2026-06-04** — Fix bugs found in a full-codebase audit
 - **2026-06-04** — Add coordination primitives: claims, task board, git presence

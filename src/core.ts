@@ -402,48 +402,133 @@ export function releaseClaim(opts: { linkId: string; resource: string; holder: s
   return { released: mine.length };
 }
 
+/**
+ * Given a set of paths (e.g. a commit's staged files), return the active leases held by SOMEONE
+ * ELSE that overlap them. Powers the `sonar guard` pre-commit hook — your own leases never block you.
+ */
+export function checkClaimConflicts(opts: { linkId: string; holder?: string; paths: string[] }) {
+  const active = listClaims(opts.linkId);
+  const conflicts: { path: string; resource: string; holder: string; expires_at: string }[] = [];
+  for (const p of opts.paths) {
+    for (const c of active) {
+      if (c.holder === opts.holder) continue;
+      if (resourcesOverlap(c.resource, p)) conflicts.push({ path: p, resource: c.resource, holder: c.holder, expires_at: c.expires_at });
+    }
+  }
+  return conflicts;
+}
+
 // ---------------------------------------------------------------------------
 // Shared task board
 // ---------------------------------------------------------------------------
 export const TASK_STATUS = ['todo', 'doing', 'done', 'blocked'] as const;
 
+const TASK_COLS = 'num, title, status, assignee, note, deps, created_by, created_at, updated_at';
+
+function parseDeps(raw: unknown): number[] {
+  if (!raw || typeof raw !== 'string') return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((n) => Number.isInteger(n) && n > 0) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Validate + normalise a dependency list: existing task nums, deduped, no self-ref. */
+function sanitizeDeps(linkId: string, deps: number[] | undefined, selfNum?: number): number[] {
+  if (!deps?.length) return [];
+  const uniq = [...new Set(deps.map(Number))].filter((n) => Number.isInteger(n) && n > 0 && n !== selfNum);
+  for (const d of uniq) if (!getTask(linkId, d)) throw new Error(`dependency #${d} does not exist on ${linkId}`);
+  return uniq.sort((a, b) => a - b);
+}
+
+/** Of a task's deps, which are not yet done (i.e. still blocking it). */
+export function unresolvedDeps(linkId: string, num: number): number[] {
+  const t = getTask(linkId, num);
+  if (!t) return [];
+  return parseDeps(t.deps).filter((d) => {
+    const dep = getTask(linkId, d);
+    return !dep || dep.status !== 'done';
+  });
+}
+
+// When task `completedNum` is done, flip any task that was blocked SOLELY waiting on it (and whose
+// other deps are now all done) back to 'todo'. Returns the nums that were unblocked.
+function autoUnblock(linkId: string, completedNum: number): number[] {
+  const flipped: number[] = [];
+  const rows = db.prepare('SELECT num, status, deps FROM tasks WHERE link_id = ?').all(linkId) as any[];
+  for (const t of rows) {
+    const deps = parseDeps(t.deps);
+    if (t.status === 'blocked' && deps.includes(completedNum) && unresolvedDeps(linkId, t.num).length === 0) {
+      db.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE link_id = ? AND num = ?").run(now(), linkId, t.num);
+      flipped.push(t.num);
+    }
+  }
+  return flipped;
+}
+
 export function getTask(linkId: string, num: number) {
-  return db
-    .prepare('SELECT num, title, status, assignee, note, created_by, created_at, updated_at FROM tasks WHERE link_id = ? AND num = ?')
-    .get(linkId, num) as any;
+  return db.prepare(`SELECT ${TASK_COLS} FROM tasks WHERE link_id = ? AND num = ?`).get(linkId, num) as any;
 }
 
 export function listTasks(opts: { linkId: string; status?: string }) {
   if (opts.status) {
-    return db
-      .prepare('SELECT num, title, status, assignee, note, updated_at FROM tasks WHERE link_id = ? AND status = ? ORDER BY num')
-      .all(opts.linkId, opts.status) as any[];
+    return db.prepare(`SELECT ${TASK_COLS} FROM tasks WHERE link_id = ? AND status = ? ORDER BY num`).all(opts.linkId, opts.status) as any[];
   }
-  return db.prepare('SELECT num, title, status, assignee, note, updated_at FROM tasks WHERE link_id = ? ORDER BY num').all(opts.linkId) as any[];
+  return db.prepare(`SELECT ${TASK_COLS} FROM tasks WHERE link_id = ? ORDER BY num`).all(opts.linkId) as any[];
 }
 
-export function createTask(opts: { linkId: string; title: string; assignee?: string; note?: string; by?: string }) {
+export function createTask(opts: { linkId: string; title: string; assignee?: string; note?: string; by?: string; deps?: number[] }) {
   if (!linkExists(opts.linkId)) throw new Error(`No link with id "${opts.linkId}".`);
   if (!opts.title?.trim()) throw new Error('title is required');
+  const deps = sanitizeDeps(opts.linkId, opts.deps);
   const ts = now();
   const numRow = db.prepare('SELECT COALESCE(MAX(num), 0) + 1 AS next FROM tasks WHERE link_id = ?').get(opts.linkId) as any;
   const num = numRow.next as number;
+  // A task with unfinished deps starts 'blocked'; it auto-flips to 'todo' when they all complete.
+  const status = deps.some((d) => getTask(opts.linkId, d)?.status !== 'done') ? 'blocked' : 'todo';
   db.prepare(
-    `INSERT INTO tasks (link_id, num, title, status, assignee, note, created_by, created_at, updated_at)
-     VALUES (?, ?, ?, 'todo', ?, ?, ?, ?, ?)`
-  ).run(opts.linkId, num, opts.title.trim(), opts.assignee ?? null, opts.note ?? null, opts.by ?? null, ts, ts);
+    `INSERT INTO tasks (link_id, num, title, status, assignee, note, deps, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(opts.linkId, num, opts.title.trim(), status, opts.assignee ?? null, opts.note ?? null, deps.length ? JSON.stringify(deps) : null, opts.by ?? null, ts, ts);
   return getTask(opts.linkId, num);
 }
 
-export function updateTask(opts: { linkId: string; num: number; status?: string; assignee?: string; note?: string }) {
+export function updateTask(opts: {
+  linkId: string;
+  num: number;
+  status?: string;
+  assignee?: string;
+  note?: string;
+  deps?: number[];
+}): { task: any; unblocked: number[] } {
   const task = getTask(opts.linkId, opts.num);
   if (!task) throw new Error(`No task #${opts.num} on ${opts.linkId}.`);
   if (opts.status && !TASK_STATUS.includes(opts.status as any)) throw new Error(`status must be one of: ${TASK_STATUS.join(', ')}`);
+
+  const deps = opts.deps !== undefined ? sanitizeDeps(opts.linkId, opts.deps, opts.num) : parseDeps(task.deps);
+  const pending = deps.filter((d) => getTask(opts.linkId, d)?.status !== 'done');
+
+  // Can't start or finish a task while its dependencies are unfinished.
+  if ((opts.status === 'doing' || opts.status === 'done') && pending.length) {
+    throw new Error(`task #${opts.num} is blocked by unfinished ${pending.map((n) => '#' + n).join(', ')} — finish those first`);
+  }
+
+  // If the caller didn't set an explicit status but changed deps, derive the blocked/unblocked state.
+  let status = opts.status;
+  if (!status && opts.deps !== undefined) {
+    if (pending.length) status = 'blocked';
+    else if (task.status === 'blocked') status = 'todo';
+  }
+
   db.prepare(
-    `UPDATE tasks SET status = COALESCE(?, status), assignee = COALESCE(?, assignee), note = COALESCE(?, note), updated_at = ?
+    `UPDATE tasks SET status = COALESCE(?, status), assignee = COALESCE(?, assignee), note = COALESCE(?, note), deps = ?, updated_at = ?
      WHERE link_id = ? AND num = ?`
-  ).run(opts.status ?? null, opts.assignee ?? null, opts.note ?? null, now(), opts.linkId, opts.num);
-  return getTask(opts.linkId, opts.num);
+  ).run(status ?? null, opts.assignee ?? null, opts.note ?? null, deps.length ? JSON.stringify(deps) : null, now(), opts.linkId, opts.num);
+
+  const unblocked = status === 'done' ? autoUnblock(opts.linkId, opts.num) : [];
+  return { task: getTask(opts.linkId, opts.num), unblocked };
 }
 
 // ---------------------------------------------------------------------------

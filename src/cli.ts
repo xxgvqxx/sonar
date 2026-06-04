@@ -640,6 +640,161 @@ function cmdBar(args: string[]) {
   console.log(`If it doesn't appear, run: sonar bar fg   (to see errors)`);
 }
 
+// --------------------------------------------------------------------------
+// claim enforcement (pre-commit guard) + quality-gate hooks inspection
+// --------------------------------------------------------------------------
+const GUARD_START = '# >>> sonar guard >>>';
+const GUARD_END = '# <<< sonar guard <<<';
+
+function git(args: string[]): string {
+  return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+}
+function gitTry(args: string[]): string | null {
+  try {
+    return git(args);
+  } catch {
+    return null;
+  }
+}
+function repoRoot(): string | null {
+  return gitTry(['rev-parse', '--show-toplevel']);
+}
+function hookDir(root: string): string {
+  const hp = gitTry(['-C', root, 'config', '--get', 'core.hooksPath']);
+  return hp ? path.resolve(root, hp) : path.join(root, '.git', 'hooks');
+}
+
+async function cmdGuard(args: string[]) {
+  const sub = args[0];
+  if (sub === 'check') return guardCheck();
+  if (sub === 'install') return guardInstall(args.slice(1));
+  if (sub === 'uninstall') return guardUninstall();
+  if (sub === 'status') return guardStatus();
+  throw new Error('usage: sonar guard <install [--link <id>] [--label <name>] [--hub <url>] [--token <t>] | check | status | uninstall>');
+}
+
+function guardInstall(args: string[]) {
+  const root = repoRoot();
+  if (!root) throw new Error('not inside a git repository.');
+  let link: string | undefined, label: string | undefined, hub: string | undefined, token: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--link') link = args[++i];
+    else if (args[i] === '--label') label = args[++i];
+    else if (args[i] === '--hub') hub = args[++i];
+    else if (args[i] === '--token') token = args[++i];
+  }
+  // Persist coordinates in this repo's git config so the hook is self-contained.
+  if (link) git(['-C', root, 'config', 'sonar.link', link]);
+  if (label) git(['-C', root, 'config', 'sonar.label', label]);
+  if (hub) git(['-C', root, 'config', 'sonar.hub', hub]);
+  if (token) git(['-C', root, 'config', 'sonar.token', token]);
+  link = link || gitTry(['-C', root, 'config', '--get', 'sonar.link']) || undefined;
+  label = label || gitTry(['-C', root, 'config', '--get', 'sonar.label']) || undefined;
+  if (!link || !label) throw new Error("provide --link <id> and --label <your-participant-label> (stored in this repo's git config).");
+
+  const dir = hookDir(root);
+  fs.mkdirSync(dir, { recursive: true });
+  const hookPath = path.join(dir, 'pre-commit');
+  const block = `${GUARD_START}\n"${process.execPath}" --disable-warning=ExperimentalWarning "${SELF}" guard check || exit 1\n${GUARD_END}\n`;
+  let body: string;
+  if (fs.existsSync(hookPath)) {
+    body = fs.readFileSync(hookPath, 'utf8');
+    if (body.includes(GUARD_START)) body = body.replace(new RegExp(`${GUARD_START}[\\s\\S]*?${GUARD_END}\\n?`), block);
+    else body = (body.endsWith('\n') ? body : body + '\n') + '\n' + block;
+  } else {
+    body = `#!/bin/sh\n${block}`;
+  }
+  fs.writeFileSync(hookPath, body);
+  fs.chmodSync(hookPath, 0o755);
+  console.log(`Installed sonar guard pre-commit hook → ${hookPath}`);
+  console.log(`  link=${link} label=${label}${hub ? ` hub=${hub}` : ''}`);
+  console.log('Commits touching a file another participant has claimed will be blocked.');
+  console.log('Bypass once with:  git commit --no-verify   (or  SONAR_GUARD_OFF=1 git commit …)');
+}
+
+function guardUninstall() {
+  const root = repoRoot();
+  if (!root) throw new Error('not inside a git repository.');
+  const hookPath = path.join(hookDir(root), 'pre-commit');
+  if (!fs.existsSync(hookPath)) return console.log('no pre-commit hook to clean.');
+  let body = fs.readFileSync(hookPath, 'utf8');
+  if (!body.includes(GUARD_START)) return console.log('sonar guard is not installed in the pre-commit hook.');
+  body = body.replace(new RegExp(`\\n?${GUARD_START}[\\s\\S]*?${GUARD_END}\\n?`), '\n');
+  if (body.replace(/^#!.*\n?/, '').trim() === '') fs.rmSync(hookPath, { force: true });
+  else fs.writeFileSync(hookPath, body);
+  console.log('Removed sonar guard from the pre-commit hook (git config sonar.* left intact).');
+}
+
+function guardStatus() {
+  const root = repoRoot();
+  if (!root) return console.log('not inside a git repository.');
+  const hookPath = path.join(hookDir(root), 'pre-commit');
+  const installed = fs.existsSync(hookPath) && fs.readFileSync(hookPath, 'utf8').includes(GUARD_START);
+  console.log(`sonar guard: ${installed ? 'installed' : 'not installed'}  (${hookPath})`);
+  console.log(`  link=${gitTry(['-C', root, 'config', '--get', 'sonar.link']) || '(unset)'} label=${gitTry(['-C', root, 'config', '--get', 'sonar.label']) || '(unset)'} hub=${gitTry(['-C', root, 'config', '--get', 'sonar.hub']) || BASE_URL}`);
+}
+
+// The pre-commit entrypoint. MUST fail-open (exit 0) on anything but a positively-detected
+// conflict, so it never breaks normal commits when sonar isn't in use or the hub is unreachable.
+async function guardCheck() {
+  try {
+    if (process.env.SONAR_GUARD_OFF) process.exit(0);
+    const root = repoRoot();
+    if (!root) process.exit(0);
+    const link = gitTry(['-C', root, 'config', '--get', 'sonar.link']);
+    const label = gitTry(['-C', root, 'config', '--get', 'sonar.label']);
+    if (!link || !label) process.exit(0);
+    const staged = gitTry(['-C', root, 'diff', '--cached', '--name-only']) || '';
+    const paths = staged.split('\n').map((s) => s.trim()).filter(Boolean);
+    if (!paths.length) process.exit(0);
+
+    const hub = gitTry(['-C', root, 'config', '--get', 'sonar.hub']) || BASE_URL;
+    const token = gitTry(['-C', root, 'config', '--get', 'sonar.token']) || getToken();
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (token) headers['authorization'] = `Bearer ${token}`;
+    let conflicts: any[] = [];
+    try {
+      const res = await fetch(`${hub}/api/links/${link}/claims/check`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ holder: label, paths }),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!res.ok) {
+        process.stderr.write(`sonar guard: skipped (hub HTTP ${res.status})\n`);
+        process.exit(0);
+      }
+      conflicts = (await res.json()).conflicts || [];
+    } catch (e) {
+      process.stderr.write(`sonar guard: skipped (${(e as Error).message})\n`);
+      process.exit(0); // hub down / unreachable → never block a commit
+    }
+    if (!conflicts.length) process.exit(0);
+
+    process.stderr.write(`\n✋ sonar guard: commit blocked — files claimed by another participant on link ${link}:\n`);
+    for (const c of conflicts) process.stderr.write(`   • ${c.path}  → leased by ${c.holder} (resource "${c.resource}", until ${c.expires_at})\n`);
+    process.stderr.write('\n   Coordinate in the shared doc, wait for the lease to lapse, or bypass once with:  git commit --no-verify\n\n');
+    process.exit(1);
+  } catch (e) {
+    process.stderr.write(`sonar guard: internal error, allowing commit (${(e as Error).message})\n`);
+    process.exit(0);
+  }
+}
+
+async function cmdHooks(_args: string[]) {
+  const { loadHooks, HOOKS_FILE } = await import('./hooks.ts');
+  const hooks = loadHooks();
+  const keys = Object.keys(hooks);
+  console.log(`Quality-gate hooks: ${HOOKS_FILE}`);
+  if (!keys.length) {
+    console.log('  (none configured)');
+    console.log('  Example  ~/.sonar/hooks.json:  { "task_completed": "npm test --silent", "task_created": "./scripts/validate-task.sh" }');
+    console.log('  A non-zero exit blocks the operation; context arrives via SONAR_EVENT / SONAR_LINK / SONAR_NUM / SONAR_TITLE / SONAR_FROM env vars.');
+    return;
+  }
+  for (const k of keys) console.log(`  ${k}: ${hooks[k]}`);
+}
+
 function cmdHelp() {
   console.log(`sonar ${VERSION} — cross-session context bridge for Claude Code + Codex CLI
 
@@ -663,6 +818,13 @@ Terminal helpers (talk to the running hub):
   sonar rm <id>                        delete a link and its doc
   sonar reindex                        rebuild the transcript search index
   sonar worktrees [prune <name|--all>] list / clean up worker git worktrees
+
+Coordination enforcement:
+  sonar guard install --link <id> --label <name> [--hub <url>] [--token <t>]
+                                       install a pre-commit hook that blocks commits touching files
+                                       another participant has claimed on the link
+  sonar guard status | uninstall       inspect / remove the pre-commit guard in this repo
+  sonar hooks                          show configured quality-gate hooks (~/.sonar/hooks.json)
 
 Menu bar app:
   sonar bar            launch the macOS menu bar control panel (uv + rumps)
@@ -714,6 +876,10 @@ const run = async () => {
       return cmdReindex();
     case 'worktrees':
       return cmdWorktrees(rest);
+    case 'guard':
+      return cmdGuard(rest);
+    case 'hooks':
+      return cmdHooks(rest);
     case 'port':
       return cmdPort(rest);
     case 'bar':

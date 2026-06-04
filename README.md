@@ -99,17 +99,40 @@ For **instant** back‑and‑forth, both sessions must be active on the link at 
 
 When two sessions edit the **same repo** at once, talking isn't enough — they can still clobber the same file, redo each other's work, or push onto a branch the other is behind on. Three coordination primitives close that gap. All three are pure data (safe for remote callers with a token — no code runs on the hub), and each renders into a doc section so a single `doc_read` shows the whole picture and the menu‑bar viewer displays it for free.
 
-- **Claims (leases) — don't clobber.** Before editing a shared file, `claim(resource="apps/web/api-client.ts", from="…")`. If the other session already holds an overlapping lease, the call returns the conflict (who holds it, until when) instead of acquiring — so you work elsewhere or coordinate. Overlap is **path‑aware**: claiming a directory covers the files under it. Leases **auto‑expire** (default 30 min, re‑claim to extend) so a vanished agent never deadlocks the repo; `release(...)` frees one early, and `steal=true` overrides a clearly stale one. Active leases live in the **Claims** section.
-- **Task board — split the work.** `task_add(title="…")` puts an item on a shared **todo/doing/done/blocked** board (surfaced in **Tasks**). `task_update(num=N, status="doing", assignee=you)` claims it; `status="done"` finishes it. Agents pull from the board instead of negotiating in prose.
+- **Claims (leases) — don't clobber.** Before editing a shared file, `claim(resource="apps/web/api-client.ts", from="…")`. If the other session already holds an overlapping lease, the call returns the conflict (who holds it, until when) instead of acquiring — so you work elsewhere or coordinate. Overlap is **path‑aware**: claiming a directory covers the files under it. Leases **auto‑expire** (default 30 min, re‑claim to extend) so a vanished agent never deadlocks the repo; `release(...)` frees one early, and `steal=true` overrides a clearly stale one. Active leases live in the **Claims** section. Claims are advisory by default — to give them teeth, install the [pre‑commit guard](#enforcing-claims-pre-commit-guard).
+- **Task board — split the work.** `task_add(title="…")` puts an item on a shared **todo/doing/done/blocked** board (surfaced in **Tasks**). `task_update(num=N, status="doing", assignee=you)` claims it; `status="done"` finishes it. Tasks can **depend** on others: `task_add(title="…", depends_on=[1,2])` starts **blocked** and refuses `doing`/`done` until #1 and #2 are `done`; finishing a task **auto‑unblocks** anything waiting only on it (and pings the link). Agents pull from the board instead of negotiating in prose.
 - **Git presence — stay aware.** `git_sync(from="…", branch=…, ahead=…, behind=…, changed=…, files=[…])` publishes your tree and returns what every other participant last reported, so the frontend dev sees "backend is on `feat/api` ↑2, just touched `shared/types.ts`." It's **agent‑reported** (the agent runs `git` locally and passes the numbers) so it works across machines, where the hub can't see a remote teammate's working tree. State lives in **Git**.
 
 ```
 # A is about to refactor the API client; B is on the backend
 claim(link_id, resource="apps/web/api-client.ts", from="claude@feat/auth")     # A: locks the file
 task_add(link_id, title="Add /v2/orders endpoint", from="codex@main", assignee="codex@main")
+task_add(link_id, title="Deploy", from="codex@main", depends_on=[1,2])         # starts blocked → auto-unblocks
 git_sync(link_id, from="codex@main", branch="feat/api", ahead=2, changed=1, files=["shared/types.ts"])
 # A's next doc_read shows the claim it holds, the open task, and that B just touched shared/types.ts
 ```
+
+### Enforcing claims (pre-commit guard)
+
+Claims are advisory — an agent sees a conflict when it calls `claim`, but nothing stops a commit. To make them binding, install a **pre‑commit hook** in a repo:
+
+```bash
+sonar guard install --link <id> --label <your-participant-label>
+# on a teammate's machine pointing at the shared hub:
+sonar guard install --link <id> --label bob --hub http://<hub-ip>:7610 [--token <t>]
+```
+
+Before each commit the hook checks the staged files against the link's active leases; if any file is claimed by **another** participant, the commit is **blocked** with who holds it and until when. It **fails open** — if the hub is unreachable, no link/label is configured, or anything errors, the commit proceeds (the guard never breaks a normal commit). Bypass once with `git commit --no-verify` (or `SONAR_GUARD_OFF=1`). `sonar guard status` shows config; `sonar guard uninstall` removes it. Link/label/hub are stored in the repo's `git config` (`sonar.link`, `sonar.label`, `sonar.hub`), and the hook respects an existing `core.hooksPath`.
+
+### Quality gates (hooks)
+
+The hub can run an operator‑defined command on coordination events and **block** the operation on a non‑zero exit — e.g. require tests to pass before a task can be marked done. Configure `~/.sonar/hooks.json`:
+
+```json
+{ "task_completed": "npm test --silent", "task_created": "./scripts/validate-task.sh" }
+```
+
+`task_completed` runs when an agent marks a task `done` (block = the task stays open and the command's output comes back as the reason); `task_created` runs when a task is added. Context arrives as env vars (`SONAR_EVENT`, `SONAR_LINK`, `SONAR_NUM`, `SONAR_TITLE`, `SONAR_FROM`). Hooks run **async** on the hub host so a slow gate never blocks other sessions; a gate that can't even start fails open (so a typo'd command doesn't wedge the board). `sonar hooks` prints the current config. (Tune the kill timeout with `SONAR_HOOK_TIMEOUT_MS`, default 120s.)
 
 ## Dispatch a worker
 
@@ -195,6 +218,10 @@ sonar rm <id>                  delete a link (and its doc)
 sonar reindex                  rebuild the transcript search index
 sonar worktrees [prune <name|--all>]   list / clean up worker git worktrees
 
+sonar guard install --link <id> --label <name> [--hub <url>] [--token <t>]   install a pre-commit hook enforcing claims
+sonar guard status | uninstall | check   inspect / remove / run the pre-commit claim guard
+sonar hooks                    show configured quality-gate hooks (~/.sonar/hooks.json)
+
 sonar bar [fg]                 launch the macOS menu-bar app
 ```
 
@@ -210,7 +237,7 @@ sonar bar [fg]                 launch the macOS menu-bar app
 | `doc_append` | append to a section (Context / Open questions / Answers / Decisions) + ping |
 | `doc_set_section` | replace a whole section (cleanup / finalize) |
 | `claim` / `release` | lease a file/dir so the other session avoids clobbering it (path‑overlap aware, auto‑expiring, `steal=true` overrides a stale one); surfaces in the doc **Claims** |
-| `task_add` / `task_update` | shared todo/doing/done/blocked board (assignee + note); `task_update` claims (`status="doing"`) or finishes (`status="done"`); surfaces in the doc **Tasks** |
+| `task_add` / `task_update` | shared todo/doing/done/blocked board (assignee, note, `depends_on` with auto‑unblock); `task_update` claims (`status="doing"`) or finishes (`status="done"`); surfaces in the doc **Tasks** |
 | `git_sync` | report your branch / ahead‑behind / changed files and get the peers' back (agent‑reported, so it works cross‑machine); surfaces in the doc **Git** |
 | `spawn_worker` | launch a Claude/Codex worker in an isolated worktree, joined to the link (runs on the hub host; remote callers gated by `SONAR_ALLOW_REMOTE_EXEC`) |
 | `post` / `read` | send / read "doc changed" pings |
@@ -230,7 +257,9 @@ Environment variables (set before `sonar start`):
 | `SONAR_INDEX_POLL_MS` | `4000` | how often transcripts are rescanned |
 | `SONAR_HOST` | `127.0.0.1` | bind address; set `0.0.0.0` to expose on the LAN |
 | `SONAR_TOKEN` | _(none)_ | shared access token required of remote callers (also read from `config.json`) |
-| `SONAR_ALLOW_REMOTE_EXEC` | _(off)_ | permit code‑exec endpoints/tools for remote callers (off by default) |
+| `SONAR_ALLOW_REMOTE_EXEC` | _(off)_ | permit code‑exec endpoints/tools for remote callers (off by default; only `1`/`true`/`yes`/`on` enable) |
+| `SONAR_HOOK_TIMEOUT_MS` | `120000` | max runtime for a quality‑gate hook before it's killed (and treated as a block) |
+| `SONAR_GUARD_OFF` | _(off)_ | when set, the pre‑commit claim guard skips its check (commit proceeds) |
 
 **Port resolution:** `SONAR_PORT` env → `~/.sonar/config.json` (written by `sonar port`) → `7610`. If the port is taken, `sonar install` automatically falls back to the next free one, and `sonar start` points you to `sonar port auto`. Changing the port **re-registers the MCP URL** with Claude Code and Codex and the menu bar follows it automatically — so it stays consistent everywhere.
 
@@ -284,7 +313,8 @@ sonar/
     cli.ts        CLI + daemon lifecycle + install
     server.ts     HTTP server: MCP (/mcp) + REST (/api/*)
     tools.ts      MCP tool definitions
-    core.ts       links, messages, long-poll waiters + read cursors, claims/tasks/git-presence
+    core.ts       links, messages, long-poll waiters + read cursors, claims/tasks(+deps)/git-presence
+    hooks.ts      operator quality-gate hooks (task_created/task_completed) run on the hub
     docs.ts       shared markdown doc read/append/section (compact + section reads, Log rotation→context.archive.md)
     spawn.ts      worker dispatch (git worktree + terminal/headless launch) + worker registry/status
     tmux.ts       launch sessions in tmux + wake a paused pane (send-keys, idle-gated)
