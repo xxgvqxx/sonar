@@ -170,12 +170,19 @@ export function startServer() {
   app.get(
     '/api/links/:id/wait',
     wrap(async (req, res) => {
+      // Cancel the long-poll if the client hangs up, so the waiter is unregistered immediately
+      // instead of lingering until timeout. (settle() is idempotent, so a close after a normal
+      // response is a harmless no-op.)
+      const ac = new AbortController();
+      res.on('close', () => ac.abort());
       const r = await core.waitForMessages({
         linkId: req.params.id,
         from: req.query.from as string | undefined,
         afterSeq: numQ(req.query.after) ?? 0,
         timeoutMs: numQ(req.query.timeout),
+        signal: ac.signal,
       });
+      if (r.aborted || res.headersSent) return; // client gone — nothing to send
       res.json(r);
     })
   );

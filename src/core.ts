@@ -169,7 +169,8 @@ export async function waitForMessages(opts: {
   from?: string;
   afterSeq?: number;
   timeoutMs?: number;
-}): Promise<{ messages: any[]; timedOut: boolean }> {
+  signal?: AbortSignal;
+}): Promise<{ messages: any[]; timedOut: boolean; aborted?: boolean }> {
   if (!linkExists(opts.linkId)) throw new Error(`No link with id "${opts.linkId}".`);
   const key = opts.from ? `${opts.linkId}:${opts.from}` : null;
   // Default to the caller's read cursor so a wait() loop doesn't keep re-returning old messages.
@@ -182,6 +183,10 @@ export async function waitForMessages(opts: {
   };
   const peek = () => readMessages({ linkId: opts.linkId, sinceSeq: afterSeq, excludeFrom: opts.from });
 
+  // Caller already gone (HTTP client disconnected / request cancelled before we parked) — return
+  // without advancing the cursor, so messages aren't marked delivered to someone who left.
+  if (opts.signal?.aborted) return { messages: [], timedOut: true, aborted: true };
+
   const immediate = peek();
   if (immediate.length) return { messages: advance(immediate), timedOut: false };
 
@@ -189,25 +194,23 @@ export async function waitForMessages(opts: {
     const set = waiters.get(opts.linkId) ?? new Set<Waiter>();
     waiters.set(opts.linkId, set);
     let done = false;
-    const waiter: Waiter = {
-      from: opts.from,
-      resolve: () => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        set.delete(waiter);
-        if (set.size === 0) waiters.delete(opts.linkId);
-        resolve({ messages: advance(peek()), timedOut: false });
-      },
-    };
-    const timer = setTimeout(() => {
+    // Three ways to settle — woken by a new message (wake() calls waiter.resolve), timed out, or
+    // the caller aborted (disconnect). Each settles once and unregisters the waiter + abort
+    // listener, so a dropped connection can't leave a waiter parked for the whole timeout window.
+    const settle = (result: { messages: any[]; timedOut: boolean; aborted?: boolean }) => {
       if (done) return;
       done = true;
+      clearTimeout(timer);
       set.delete(waiter);
       if (set.size === 0) waiters.delete(opts.linkId);
-      resolve({ messages: advance(peek()), timedOut: true });
-    }, timeoutMs);
+      opts.signal?.removeEventListener('abort', onAbort);
+      resolve(result);
+    };
+    const waiter: Waiter = { from: opts.from, resolve: () => settle({ messages: advance(peek()), timedOut: false }) };
+    const timer = setTimeout(() => settle({ messages: advance(peek()), timedOut: true }), timeoutMs);
+    const onAbort = () => settle({ messages: [], timedOut: true, aborted: true });
     set.add(waiter);
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 

@@ -327,8 +327,10 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
         timeout_ms: z.number().optional().describe('Max wait in ms (default 25000, max 110000).'),
       },
     },
-    async (a) => {
-      const r = await core.waitForMessages({ linkId: a.link_id, from: a.from, afterSeq: a.after_seq, timeoutMs: a.timeout_ms });
+    async (a, extra) => {
+      // extra.signal aborts if the MCP client cancels/disconnects — thread it through so the
+      // waiter is released right away rather than held until timeout.
+      const r = await core.waitForMessages({ linkId: a.link_id, from: a.from, afterSeq: a.after_seq, timeoutMs: a.timeout_ms, signal: extra?.signal });
       if (r.timedOut && !r.messages.length) {
         return text(`No new messages within the wait window. Call wait again (same args) to keep listening on ${a.link_id}.`);
       }
