@@ -101,11 +101,12 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
       const docFile = docs.ensureDoc(a.link_id, r.link?.title);
       syncParticipants(a.link_id);
       docs.appendLog(a.link_id, a.label, 'joined the link');
-      const doc = docs.readDoc(a.link_id);
+      const doc = docs.readDoc(a.link_id, { compact: true });
       return text(
         `Joined ${a.link_id}${r.link?.title ? ` — ${r.link.title}` : ''} as "${a.label}".\n\n` +
           `Shared doc: ${docFile}\n\n` +
-          `=== current shared doc ===\n${doc}\n=== end doc ===\n\n` +
+          `=== current shared doc (compact — Log trimmed) ===\n${doc}\n=== end doc ===\n` +
+          `(Full doc or a single section: doc_read(link_id="${a.link_id}", section="…") or doc_read(link_id="${a.link_id}", full=true).)\n\n` +
           `Now: add your own context with doc_append(link_id="${a.link_id}", section="Context", from="${a.label}", text="…"). ` +
           `Answer any items under "Open questions" by doc_append to "Answers" and post() a ping. ` +
           `Use wait(link_id="${a.link_id}", from="${a.label}") to listen for updates.`
@@ -274,12 +275,20 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
     'doc_read',
     {
       title: 'Read the shared context doc',
-      description: "Read a link's shared markdown doc — the source of truth both agents collaborate in (context, open questions, answers, decisions). Read this before working and after any `wait` ping.",
-      inputSchema: { link_id: z.string() },
+      description:
+        "Read a link's shared markdown doc — the source of truth both agents collaborate in (context, open questions, answers, decisions). Read this before working and after any `wait` ping. " +
+        'By default returns a COMPACT view (full doc with the Log trimmed to its most recent entries — older Log entries are auto-archived). ' +
+        'Pass section="…" to read just one section (e.g. section="Log" for full Log history, or "Open questions"). Pass full=true only when you truly need the entire document.',
+      inputSchema: {
+        link_id: z.string(),
+        section: z.string().optional().describe('Read only this section, e.g. "Open questions" or "Log".'),
+        full: z.boolean().optional().describe('Return the entire document including full Log (rarely needed — the compact default is usually enough).'),
+      },
     },
     async (a) => {
       if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
-      return text(`Shared doc: ${docs.docPath(a.link_id)}\n\n${docs.readDoc(a.link_id)}`);
+      const body = a.section ? docs.readDoc(a.link_id, { section: a.section }) : a.full ? docs.readDoc(a.link_id) : docs.readDoc(a.link_id, { compact: true });
+      return text(`Shared doc: ${docs.docPath(a.link_id)}\n\n${body}`);
     }
   );
 
@@ -299,7 +308,8 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
     async (a) => {
       if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
       docs.appendToSection(a.link_id, a.section, a.text, a.from);
-      core.postMessage({ linkId: a.link_id, from: a.from, body: `📝 updated doc → ${a.section}: ${a.text.replace(/\s+/g, ' ').slice(0, 140)}` });
+      // Terse ping only — fires any wait() without re-duplicating the prose into the message stream.
+      core.postMessage({ linkId: a.link_id, from: a.from, body: `📝 ${a.from} appended to "${a.section}"` });
       return text(`Appended to "${a.section}" and pinged the link. Doc: ${docs.docPath(a.link_id)}` + pending(a.link_id, a.from));
     }
   );

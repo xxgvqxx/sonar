@@ -93,6 +93,8 @@ Why a doc instead of a chat? These agents are **turn‑based** — they only act
 
 For **instant** back‑and‑forth, both sessions must be active on the link at the same time (`/sonar <id>` on each). The `/sonar` command keeps each agent in a listen loop (`wait` → handle → report to you → repeat) and surfaces every update.
 
+**Token‑efficient reads.** The doc never re‑pays for its whole history on every glance. `doc_read` returns a **compact view** by default — every section, but the append‑only **Log** trimmed to its most recent entries — and the on‑disk Log auto‑rotates: older entries spill to `context.archive.md` so `context.md` stays bounded. Read a single section with `doc_read(section="…")` (e.g. `section="Log"` for the full live Log), or the entire document with `doc_read(full=true)`. Doc‑change pings stay terse (they say *what* changed, not a copy of the prose) so the message stream doesn't duplicate the doc. For a frontend⇄backend pair, the efficient pattern is to keep the shared **contract** (API shape / types) in a section you `doc_set_section` (replace, bounded) and use `post`/`wait` for "I changed X" change events.
+
 ## Dispatch a worker
 
 Spawn a new agent, pre‑joined to a link, that works a task and writes back into the doc:
@@ -187,10 +189,10 @@ sonar bar [fg]                 launch the macOS menu-bar app
 | `link_create` | mint a link + shared doc, return a short ID |
 | `link_join` | join by ID; returns participants + the current shared doc |
 | `link_list` / `link_info` | discover / inspect links |
-| `doc_read` | read the shared context doc (the source of truth) |
+| `doc_read` | read the shared context doc; **compact by default** (Log trimmed to recent entries), `section="…"` for one section, `full=true` for everything |
 | `doc_append` | append to a section (Context / Open questions / Answers / Decisions) + ping |
 | `doc_set_section` | replace a whole section (cleanup / finalize) |
-| `spawn_worker` | launch a Claude/Codex worker in an isolated worktree, joined to the link |
+| `spawn_worker` | launch a Claude/Codex worker in an isolated worktree, joined to the link (runs on the hub host; remote callers gated by `SONAR_ALLOW_REMOTE_EXEC`) |
 | `post` / `read` | send / read "doc changed" pings |
 | `wait` | long‑poll until the link changes (or timeout); per‑participant cursor so a loop blocks correctly |
 | `search_context` | FTS over indexed Claude + Codex history; filter by repo / branch / agent |
@@ -263,7 +265,7 @@ sonar/
     server.ts     HTTP server: MCP (/mcp) + REST (/api/*)
     tools.ts      MCP tool definitions
     core.ts       links, messages, long-poll waiters + read cursors
-    docs.ts       shared markdown doc read/append/section
+    docs.ts       shared markdown doc read/append/section (compact + section reads, Log rotation→context.archive.md)
     spawn.ts      worker dispatch (git worktree + terminal/headless launch) + worker registry/status
     tmux.ts       launch sessions in tmux + wake a paused pane (send-keys, idle-gated)
     sessions.ts   process detection (ps/lsof), session listing, safe kill
