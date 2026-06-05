@@ -860,16 +860,114 @@ async function cmdConnect(args: string[]) {
   console.log('host-only tools — search_context, recent_sessions, spawn_worker — are not available on a remote hub.');
 }
 
-// Expose the LOCAL hub to remote teammates through an ephemeral tunnel (cloudflared / ngrok),
-// mint a per-member token for them, and tear it all down on exit.
+// A managed background tunnel: start it once, query/copy it anytime with `status`, tear it down
+// with `stop`. State (provider/pid/url/token) persists in ~/.sonar/tunnel.json so any later CLI
+// invocation can manage it — no terminal stays tied up.
+const TUNNEL_FILE = path.join(DATA_DIR, 'tunnel.json');
+const TUNNEL_LOG = path.join(DATA_DIR, 'tunnel.log');
+
+function readTunnel(): any | null {
+  try {
+    return JSON.parse(fs.readFileSync(TUNNEL_FILE, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+function pidAlive(pid?: number): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+// Wait for the provider to publish its public URL. ngrok exposes a local API (:4040); both also
+// log the URL, so we scan the log too (covers cloudflared and ngrok alike).
+async function waitForTunnelUrl(provider: string, logPath: string): Promise<string | null> {
+  const re = /https:\/\/[^\s"']+\.(?:trycloudflare\.com|ngrok[-a-z.]*\.app|ngrok\.io)[^\s"']*/;
+  for (let i = 0; i < 40; i++) {
+    if (provider === 'ngrok') {
+      try {
+        const r = await fetch('http://127.0.0.1:4040/api/tunnels', { signal: AbortSignal.timeout(1000) });
+        if (r.ok) {
+          const j: any = await r.json();
+          const u = (j.tunnels || []).map((t: any) => t.public_url).find((x: string) => x && x.startsWith('https'));
+          if (u) return u.replace(/\/+$/, '');
+        }
+      } catch {
+        /* not up yet */
+      }
+    }
+    try {
+      const m = fs.readFileSync(logPath, 'utf8').match(re);
+      if (m) return m[0].replace(/\/+$/, '');
+    } catch {
+      /* no log yet */
+    }
+    await sleep(300);
+  }
+  return null;
+}
+
+function printTunnelInfo(t: any) {
+  const base = String(t.url).replace(/\/+$/, '');
+  const bar = '━'.repeat(64);
+  console.log(bar);
+  console.log(`Tunnel:        ${t.provider}${t.startedAt ? `  (since ${t.startedAt})` : ''}`);
+  console.log(`Public URL:    ${base}/mcp`);
+  console.log(`Member token:  ${t.token}   (name: ${t.name})`);
+  console.log('\nGive your teammate ONE of these — then they restart Claude Code / Codex:');
+  console.log(`    sonar connect ${base} --token ${t.token}`);
+  console.log(`    claude mcp add --transport http --scope user sonar ${base}/mcp --header "Authorization: Bearer ${t.token}"`);
+  console.log(bar);
+}
+
 async function cmdTunnel(args: string[]) {
-  if (args[0] === 'off') {
+  const sub = args[0];
+  if (sub === 'status') return tunnelStatus();
+  if (sub === 'stop' || sub === 'off') return tunnelStop();
+  return tunnelStart(args);
+}
+
+function tunnelStatus() {
+  const t = readTunnel();
+  if (!t) return console.log('No tunnel running. Start one with:  sonar tunnel');
+  if (!pidAlive(t.pid)) return console.log(`Tunnel state is stale (process ${t.pid} is gone). Clean up with:  sonar tunnel stop`);
+  printTunnelInfo(t);
+  console.log('Manage:  sonar tunnel status   |   sonar tunnel stop');
+}
+
+async function tunnelStop() {
+  const t = readTunnel();
+  try {
     await ensureUp();
     await api('POST', '/api/admin/expose', { on: false });
-    console.log('Exposed mode OFF. Remote callers can no longer reach the hub (existing tunnel, if any, should be stopped).');
-    return;
+  } catch {
+    /* hub may be down; still clean local state */
   }
+  if (!t) return console.log('No tunnel was running. Exposed mode dropped (if it was on).');
+  try {
+    if (pidAlive(t.pid)) process.kill(t.pid);
+  } catch {}
+  if (!t.keepToken && t.name) {
+    try {
+      await api('POST', '/api/admin/tokens/revoke', { token: t.name });
+    } catch {}
+  }
+  try { fs.rmSync(TUNNEL_FILE, { force: true }); } catch {}
+  try { fs.rmSync(TUNNEL_LOG, { force: true }); } catch {}
+  console.log(`Tunnel stopped${t.keepToken ? `; token "${t.name}" kept (revoke: sonar token revoke ${t.name})` : ` and token "${t.name}" revoked`}. Hub no longer exposed.`);
+}
+
+async function tunnelStart(args: string[]) {
   await ensureUp();
+  const existing = readTunnel();
+  if (existing && pidAlive(existing.pid)) {
+    console.log('A tunnel is already running:\n');
+    return tunnelStatus();
+  }
   let provider: string | undefined, memberName: string | undefined, keepToken = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--provider') provider = args[++i];
@@ -879,83 +977,51 @@ async function cmdTunnel(args: string[]) {
   provider = provider || (which('cloudflared') ? 'cloudflared' : which('ngrok') ? 'ngrok' : undefined);
   if (!provider) {
     console.log('No tunnel provider found. Install one:');
-    console.log('  cloudflared:  brew install cloudflared   (quick tunnels need no account)');
+    console.log('  cloudflared:  brew install cloudflared   (quick tunnels — no account needed)');
     console.log('  ngrok:        brew install ngrok && ngrok config add-authtoken <token>');
-    console.log('Then re-run  sonar tunnel.  (Or expose the hub yourself and run  sonar token add <name>.)');
     return;
   }
 
-  // 1) Ensure an admin token exists so THIS machine's CLI / menu bar / agents authenticate once exposed.
+  // Ensure an admin token so THIS machine's CLI / menu bar / agents still authenticate once exposed.
   let admin = getToken();
   if (!admin) {
     admin = randomBytes(18).toString('base64url');
     writeConfig({ token: admin });
     setToken(admin);
-    console.log('Generated an admin token for this hub (stored in ~/.sonar/config.json).');
-    // re-register this machine's own Claude/Codex with the token so they keep working while exposed
     installClaude(MCP_URL, admin);
     installCodex(MCP_URL, admin);
-    console.log('Re-registered this machine\'s Claude Code + Codex with the token. Restart them if a session is open.');
+    console.log("Generated an admin token (~/.sonar/config.json) and re-registered this machine's Claude/Codex with it.");
+    console.log('Restart any open local Claude/Codex session so it picks up the token.\n');
   }
 
-  // 2) Mint a per-member token for the teammate (revoked on exit unless --keep-token).
   memberName = memberName || `guest-${randomBytes(3).toString('hex')}`;
   const minted = await api('POST', '/api/admin/tokens', { name: memberName });
-
-  // 3) Flip the hub into exposed mode (loopback no longer bypasses auth — see config.isExposed).
   await api('POST', '/api/admin/expose', { on: true });
 
-  const port = PORT;
-  const cmd = provider === 'ngrok' ? 'ngrok' : 'cloudflared';
   const cmdArgs =
     provider === 'ngrok'
-      ? ['http', String(port), '--log', 'stdout', '--log-format', 'logfmt']
-      : ['tunnel', '--url', `http://127.0.0.1:${port}`];
+      ? ['http', String(PORT), '--log', 'stdout', '--log-format', 'logfmt']
+      : ['tunnel', '--url', `http://127.0.0.1:${PORT}`];
+  console.log(`Starting ${provider} tunnel → http://127.0.0.1:${PORT} (a few seconds)…`);
+  const logFd = fs.openSync(TUNNEL_LOG, 'w');
+  const child = spawn(provider, cmdArgs, { detached: true, stdio: ['ignore', logFd, logFd] });
+  child.unref();
+  fs.closeSync(logFd);
 
-  console.log(`\nStarting ${cmd} tunnel → http://127.0.0.1:${port} …\n`);
-  const child = spawn(cmd, cmdArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-  let announced = false;
-  const onData = (buf: Buffer) => {
-    const s = buf.toString();
-    const m = s.match(/https:\/\/[^\s"']+\.(?:trycloudflare\.com|ngrok[-a-z.]*\.app|ngrok\.io)[^\s"']*/);
-    if (m && !announced) {
-      announced = true;
-      const publicBase = m[0].replace(/\/+$/, '');
-      console.log('━'.repeat(60));
-      console.log(`Public hub URL:  ${publicBase}/mcp`);
-      console.log(`Member token:    ${minted.token}   (name: ${memberName})`);
-      console.log('\nTeammate runs (on their machine):');
-      console.log(`    sonar connect ${publicBase} --token ${minted.token}`);
-      console.log('  …or in Claude Code directly:');
-      console.log(`    claude mcp add --transport http --scope user sonar ${publicBase}/mcp --header "Authorization: Bearer ${minted.token}"`);
-      console.log('\nThey get coordination tools only (links / doc / messages / claims / tasks / git_sync).');
-      console.log(`Press Ctrl-C to close the tunnel${keepToken ? '' : ' and revoke the member token'}.`);
-      console.log('━'.repeat(60));
-    }
-  };
-  child.stdout?.on('data', onData);
-  child.stderr?.on('data', onData);
-
-  let cleaningUp = false;
-  const cleanup = async () => {
-    if (cleaningUp) return;
-    cleaningUp = true;
-    try { child.kill(); } catch {}
+  const url = await waitForTunnelUrl(provider, TUNNEL_LOG);
+  if (!url) {
+    try { if (child.pid) process.kill(child.pid); } catch {}
     try { await api('POST', '/api/admin/expose', { on: false }); } catch {}
-    if (!keepToken) {
-      try { await api('POST', '/api/admin/tokens/revoke', { token: memberName }); console.log(`\nRevoked member token "${memberName}". Hub no longer exposed.`); } catch {}
-    } else {
-      console.log(`\nHub no longer exposed. Member token "${memberName}" kept (revoke with: sonar token revoke ${memberName}).`);
-    }
-    process.exit(0);
-  };
-  process.on('SIGINT', cleanup);
-  process.on('SIGTERM', cleanup);
-  child.on('exit', (code) => {
-    console.log(`\nTunnel process exited (${code}).`);
-    cleanup();
-  });
+    try { await api('POST', '/api/admin/tokens/revoke', { token: memberName }); } catch {}
+    console.error(`Could not detect the tunnel URL. Check ${TUNNEL_LOG} (is ${provider} configured/authed?).`);
+    return;
+  }
+  const state = { provider, pid: child.pid, url, name: memberName, token: minted.token, keepToken, startedAt: new Date().toISOString() };
+  fs.writeFileSync(TUNNEL_FILE, JSON.stringify(state, null, 2));
+  try { fs.chmodSync(TUNNEL_FILE, 0o600); } catch {}
+  console.log('');
+  printTunnelInfo(state);
+  console.log('Runs in the background. Re-show this anytime:  sonar tunnel status   ·   Close it:  sonar tunnel stop');
 }
 
 function cmdHelp() {
@@ -969,10 +1035,10 @@ Daemon:
   sonar port <N|auto>  change the hub port (re-registers with Claude/Codex); "auto" picks a free one
 
 Remote teammates (across networks):
-  sonar tunnel [--name <member>] [--provider cloudflared|ngrok] [--keep-token]
-                       expose this hub via an ephemeral tunnel, mint a per-member token, print the
-                       connect command; Ctrl-C closes the tunnel + revokes the token
-  sonar tunnel off     turn exposed mode back off
+  sonar tunnel [--name <m>] [--provider cloudflared|ngrok] [--keep-token]
+                       start a BACKGROUND tunnel + mint a per-member token, print the connect command
+  sonar tunnel status  re-show the live tunnel URL + token + connect command
+  sonar tunnel stop    close the tunnel, drop exposed mode, revoke the token
   sonar token add <name> | list | revoke <name|token>   manage per-member access tokens (revocable)
   sonar connect <hub-url> [--token <t>]   point THIS machine's Claude/Codex at a remote sonar hub
 

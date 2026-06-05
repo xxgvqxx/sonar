@@ -142,15 +142,17 @@ The [LAN setup](#running-on-a-shared-network-lan) covers one office. For teammat
 sonar tunnel                # needs cloudflared (quick tunnels, no account) or ngrok installed
 ```
 
-`sonar tunnel` ensures an **admin token** for this hub (so your own CLI / menu bar / agents keep working once it's exposed, and re-registers your Claude/Codex with it), mints a **per-member token** for the teammate, flips the hub into **exposed mode**, starts `cloudflared`/`ngrok`, and prints:
+`sonar tunnel` ensures an **admin token** for this hub (so your own CLI / menu bar / agents keep working once it's exposed, and re-registers your Claude/Codex with it), mints a **per-member token** for the teammate, flips the hub into **exposed mode**, starts `cloudflared`/`ngrok` **in the background**, and prints:
 
 ```
-Public hub URL:  https://xxxx.trycloudflare.com/mcp
-Member token:    <token>   (name: guest-ab12)
-Teammate runs:   sonar connect https://xxxx.trycloudflare.com --token <token>
+Public URL:    https://xxxx.trycloudflare.com/mcp
+Member token:  <token>   (name: guest-ab12)
+Teammate:      sonar connect https://xxxx.trycloudflare.com --token <token>
 ```
 
-The teammate runs that `sonar connect …` (it points their Claude Code + Codex at your hub) and restarts their agent. Now both agents share the same links, shared doc, messages, claims, tasks, and git‑presence — across the internet. **Ctrl‑C** closes the tunnel and **revokes that member token** (keep it with `--keep-token`; `sonar tunnel off` just drops exposed mode).
+It returns to your prompt — the tunnel keeps running. Re-show the URL + token anytime with `sonar tunnel status`, and tear it all down with `sonar tunnel stop` (closes the tunnel, drops exposed mode, and **revokes that member token** — keep it with `--keep-token`).
+
+The teammate runs the printed `sonar connect …` (it points their Claude Code + Codex at your hub) and restarts their agent. Now both agents share the same links, shared doc, messages, claims, tasks, and git‑presence — across the internet.
 
 **Per‑member tokens.** `sonar token add <name>` / `sonar token list` / `sonar token revoke <name|token>` manage individually‑revocable credentials (only the sha‑256 hash is stored; the secret is shown once). Revoke one teammate without disturbing the others. The single `SONAR_TOKEN` (env/config) is the **admin** token — it manages the hub; per‑member tokens cannot.
 
@@ -228,7 +230,8 @@ sonar start | stop | status    manage the background hub
 sonar daemon                   run the hub in the foreground
 sonar port <N|auto>            change the hub port (re-registers with Claude/Codex); "auto" picks a free one
 sonar invite                   print the LAN URL + token + paste-ready setup for a teammate on the same network
-sonar tunnel [--name <n>] [--provider cloudflared|ngrok] [--keep-token]   expose this hub via an ephemeral tunnel + mint a per-member token (Ctrl-C revokes it); "off" drops exposed mode
+sonar tunnel [--name <n>] [--provider cloudflared|ngrok] [--keep-token]   start a background tunnel + mint a per-member token
+sonar tunnel status | stop                            re-show the live tunnel / close it (revokes the token, drops exposed mode)
 sonar token add <name> | list | revoke <name|token>   manage revocable per-member access tokens
 sonar connect <hub-url> [--token <t>]   point THIS machine's Claude/Codex at a remote sonar hub
 
