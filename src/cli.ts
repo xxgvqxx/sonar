@@ -305,7 +305,7 @@ Live back-and-forth needs the other session active on the same link at the same 
 `;
 }
 
-function installClaude(url: string): string {
+function installClaude(url: string, token?: string): string {
   try {
     fs.mkdirSync(CLAUDE_CMD_DIR, { recursive: true });
     fs.writeFileSync(path.join(CLAUDE_CMD_DIR, 'sonar.md'), SLASH_COMMAND);
@@ -313,24 +313,25 @@ function installClaude(url: string): string {
     return `  slash command: FAILED (${(e as Error).message})`;
   }
   // (re)register the MCP server with the Claude Code CLI (user scope). remove-then-add is
-  // idempotent and updates the URL when the port changes.
+  // idempotent and updates the URL when the port changes. A token (when set) is sent as a
+  // Bearer header so registration works against an exposed hub (it's ignored on a loopback hub).
   try {
     execFileSync('claude', ['mcp', 'remove', 'sonar', '-s', 'user'], { stdio: 'pipe' });
   } catch {
     /* not registered yet */
   }
+  const addArgs = ['mcp', 'add', '--transport', 'http', '--scope', 'user', 'sonar', url];
+  if (token) addArgs.push('--header', `Authorization: Bearer ${token}`);
   try {
-    execFileSync('claude', ['mcp', 'add', '--transport', 'http', '--scope', 'user', 'sonar', url], { stdio: 'pipe' });
-    return `  Claude Code: registered MCP server at ${url} + /sonar command`;
+    execFileSync('claude', addArgs, { stdio: 'pipe' });
+    return `  Claude Code: registered MCP server at ${url}${token ? ' (with token)' : ''} + /sonar command`;
   } catch (e) {
-    return (
-      `  Claude Code: /sonar command written, but auto-registration failed (${(e as Error).message}).\n` +
-      `    Run manually:  claude mcp add --transport http --scope user sonar ${url}`
-    );
+    const manual = `claude mcp add --transport http --scope user sonar ${url}${token ? ` --header "Authorization: Bearer ${token}"` : ''}`;
+    return `  Claude Code: /sonar command written, but auto-registration failed (${(e as Error).message}).\n    Run manually:  ${manual}`;
   }
 }
 
-function installCodex(url: string): string {
+function installCodex(url: string, token?: string): string {
   const lines: string[] = [];
   try {
     fs.mkdirSync(CODEX_SKILL_DIR, { recursive: true });
@@ -361,6 +362,10 @@ function installCodex(url: string): string {
     }
     if (cfg && !/rmcp_client\s*=\s*true/.test(cfg)) {
       lines.push('  ! Codex needs `rmcp_client = true` under [features] for streamable-HTTP MCP. Add it if missing.');
+    }
+    if (token) {
+      lines.push(`  ! Codex must send "Authorization: Bearer ${token}" to this hub — set it via your Codex build's`);
+      lines.push('    http_headers / bearer_token field for [mcp_servers.sonar] (key name varies by version).');
     }
   } catch (e) {
     lines.push(`  Codex config: FAILED (${(e as Error).message})`);
@@ -422,7 +427,8 @@ function installSessionInit(): string {
 
 function reRegister(port: number): string {
   const url = urlFor(port);
-  return `${installClaude(url)}\n${installCodex(url)}`;
+  const tok = getToken();
+  return `${installClaude(url, tok)}\n${installCodex(url, tok)}`;
 }
 
 async function cmdInstall() {
@@ -436,8 +442,9 @@ async function cmdInstall() {
   writePortConfig(port);
   const url = urlFor(port);
   console.log(`Installing sonar (MCP endpoint ${url})\n`);
-  console.log(installClaude(url));
-  console.log(installCodex(url));
+  const tok = getToken();
+  console.log(installClaude(url, tok));
+  console.log(installCodex(url, tok));
   console.log(installSessionInit());
   console.log('\nStarting the hub...');
   spawnDaemon(`http://${HOST}:${port}`);
@@ -795,6 +802,162 @@ async function cmdHooks(_args: string[]) {
   for (const k of keys) console.log(`  ${k}: ${hooks[k]}`);
 }
 
+// --------------------------------------------------------------------------
+// remote access: per-member tokens, ephemeral tunnel, teammate connect
+// --------------------------------------------------------------------------
+function which(bin: string): string | null {
+  try {
+    return execFileSync('/bin/sh', ['-c', `command -v ${bin}`], { encoding: 'utf8' }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function cmdToken(args: string[]) {
+  await ensureUp();
+  const sub = args[0];
+  if (sub === 'add') {
+    const name = args[1];
+    if (!name) throw new Error('usage: sonar token add <name>');
+    const r = await api('POST', '/api/admin/tokens', { name });
+    console.log(`Created per-member token "${r.name}":\n\n    ${r.token}\n`);
+    console.log('Share it once (only its hash is stored). The teammate connects with:');
+    console.log(`    sonar connect ${(getToken() ? '<hub-url>' : '<hub-url>')} --token ${r.token}`);
+    console.log(`Revoke anytime with:  sonar token revoke ${r.name}`);
+    return;
+  }
+  if (sub === 'list') {
+    const r = await api('GET', '/api/admin/tokens');
+    console.log(`exposed: ${r.exposed}`);
+    if (!r.tokens.length) return console.log('  (no per-member tokens)');
+    for (const t of r.tokens)
+      console.log(`  ${t.revoked_at ? '✗' : '●'} ${t.name}  created ${t.created_at}${t.last_used_at ? `  · last used ${t.last_used_at}` : ''}${t.revoked_at ? `  · REVOKED` : ''}`);
+    return;
+  }
+  if (sub === 'revoke') {
+    const which2 = args[1];
+    if (!which2) throw new Error('usage: sonar token revoke <name|token>');
+    const r = await api('POST', '/api/admin/tokens/revoke', { token: which2 });
+    console.log(r.revoked ? `Revoked "${r.name || which2}".` : `No active token matched "${which2}".`);
+    return;
+  }
+  throw new Error('usage: sonar token <add <name> | list | revoke <name|token>>');
+}
+
+// Point THIS machine's Claude Code + Codex at a REMOTE sonar hub (a teammate joining a shared hub).
+async function cmdConnect(args: string[]) {
+  const urlArg = args.find((a) => /^https?:\/\//.test(a));
+  if (!urlArg) throw new Error('usage: sonar connect <hub-url> [--token <token>]   (e.g. https://xxxx.trycloudflare.com)');
+  let token: string | undefined;
+  for (let i = 0; i < args.length; i++) if (args[i] === '--token') token = args[++i];
+  const base = urlArg.replace(/\/+$/, '').replace(/\/mcp$/, '');
+  const mcpUrl = `${base}/mcp`;
+  console.log(`Connecting this machine to the remote sonar hub: ${mcpUrl}${token ? ' (with token)' : ''}\n`);
+  console.log(installClaude(mcpUrl, token));
+  console.log(installCodex(mcpUrl, token));
+  console.log('\nRestart Claude Code / Codex to pick up the remote hub. (This replaces any local "sonar" registration.)');
+  console.log('Your agent gets the coordination tools (links / doc / messages / claims / tasks / git_sync);');
+  console.log('host-only tools — search_context, recent_sessions, spawn_worker — are not available on a remote hub.');
+}
+
+// Expose the LOCAL hub to remote teammates through an ephemeral tunnel (cloudflared / ngrok),
+// mint a per-member token for them, and tear it all down on exit.
+async function cmdTunnel(args: string[]) {
+  if (args[0] === 'off') {
+    await ensureUp();
+    await api('POST', '/api/admin/expose', { on: false });
+    console.log('Exposed mode OFF. Remote callers can no longer reach the hub (existing tunnel, if any, should be stopped).');
+    return;
+  }
+  await ensureUp();
+  let provider: string | undefined, memberName: string | undefined, keepToken = false;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--provider') provider = args[++i];
+    else if (args[i] === '--name') memberName = args[++i];
+    else if (args[i] === '--keep-token') keepToken = true;
+  }
+  provider = provider || (which('cloudflared') ? 'cloudflared' : which('ngrok') ? 'ngrok' : undefined);
+  if (!provider) {
+    console.log('No tunnel provider found. Install one:');
+    console.log('  cloudflared:  brew install cloudflared   (quick tunnels need no account)');
+    console.log('  ngrok:        brew install ngrok && ngrok config add-authtoken <token>');
+    console.log('Then re-run  sonar tunnel.  (Or expose the hub yourself and run  sonar token add <name>.)');
+    return;
+  }
+
+  // 1) Ensure an admin token exists so THIS machine's CLI / menu bar / agents authenticate once exposed.
+  let admin = getToken();
+  if (!admin) {
+    admin = randomBytes(18).toString('base64url');
+    writeConfig({ token: admin });
+    setToken(admin);
+    console.log('Generated an admin token for this hub (stored in ~/.sonar/config.json).');
+    // re-register this machine's own Claude/Codex with the token so they keep working while exposed
+    installClaude(MCP_URL, admin);
+    installCodex(MCP_URL, admin);
+    console.log('Re-registered this machine\'s Claude Code + Codex with the token. Restart them if a session is open.');
+  }
+
+  // 2) Mint a per-member token for the teammate (revoked on exit unless --keep-token).
+  memberName = memberName || `guest-${randomBytes(3).toString('hex')}`;
+  const minted = await api('POST', '/api/admin/tokens', { name: memberName });
+
+  // 3) Flip the hub into exposed mode (loopback no longer bypasses auth — see config.isExposed).
+  await api('POST', '/api/admin/expose', { on: true });
+
+  const port = PORT;
+  const cmd = provider === 'ngrok' ? 'ngrok' : 'cloudflared';
+  const cmdArgs =
+    provider === 'ngrok'
+      ? ['http', String(port), '--log', 'stdout', '--log-format', 'logfmt']
+      : ['tunnel', '--url', `http://127.0.0.1:${port}`];
+
+  console.log(`\nStarting ${cmd} tunnel → http://127.0.0.1:${port} …\n`);
+  const child = spawn(cmd, cmdArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  let announced = false;
+  const onData = (buf: Buffer) => {
+    const s = buf.toString();
+    const m = s.match(/https:\/\/[^\s"']+\.(?:trycloudflare\.com|ngrok[-a-z.]*\.app|ngrok\.io)[^\s"']*/);
+    if (m && !announced) {
+      announced = true;
+      const publicBase = m[0].replace(/\/+$/, '');
+      console.log('━'.repeat(60));
+      console.log(`Public hub URL:  ${publicBase}/mcp`);
+      console.log(`Member token:    ${minted.token}   (name: ${memberName})`);
+      console.log('\nTeammate runs (on their machine):');
+      console.log(`    sonar connect ${publicBase} --token ${minted.token}`);
+      console.log('  …or in Claude Code directly:');
+      console.log(`    claude mcp add --transport http --scope user sonar ${publicBase}/mcp --header "Authorization: Bearer ${minted.token}"`);
+      console.log('\nThey get coordination tools only (links / doc / messages / claims / tasks / git_sync).');
+      console.log(`Press Ctrl-C to close the tunnel${keepToken ? '' : ' and revoke the member token'}.`);
+      console.log('━'.repeat(60));
+    }
+  };
+  child.stdout?.on('data', onData);
+  child.stderr?.on('data', onData);
+
+  let cleaningUp = false;
+  const cleanup = async () => {
+    if (cleaningUp) return;
+    cleaningUp = true;
+    try { child.kill(); } catch {}
+    try { await api('POST', '/api/admin/expose', { on: false }); } catch {}
+    if (!keepToken) {
+      try { await api('POST', '/api/admin/tokens/revoke', { token: memberName }); console.log(`\nRevoked member token "${memberName}". Hub no longer exposed.`); } catch {}
+    } else {
+      console.log(`\nHub no longer exposed. Member token "${memberName}" kept (revoke with: sonar token revoke ${memberName}).`);
+    }
+    process.exit(0);
+  };
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
+  child.on('exit', (code) => {
+    console.log(`\nTunnel process exited (${code}).`);
+    cleanup();
+  });
+}
+
 function cmdHelp() {
   console.log(`sonar ${VERSION} — cross-session context bridge for Claude Code + Codex CLI
 
@@ -804,6 +967,14 @@ Daemon:
   sonar invite         print LAN URL + token + paste-ready setup for a teammate on the same network
   sonar daemon         run the hub in the foreground
   sonar port <N|auto>  change the hub port (re-registers with Claude/Codex); "auto" picks a free one
+
+Remote teammates (across networks):
+  sonar tunnel [--name <member>] [--provider cloudflared|ngrok] [--keep-token]
+                       expose this hub via an ephemeral tunnel, mint a per-member token, print the
+                       connect command; Ctrl-C closes the tunnel + revokes the token
+  sonar tunnel off     turn exposed mode back off
+  sonar token add <name> | list | revoke <name|token>   manage per-member access tokens (revocable)
+  sonar connect <hub-url> [--token <t>]   point THIS machine's Claude/Codex at a remote sonar hub
 
 Terminal helpers (talk to the running hub):
   sonar create [title]
@@ -880,6 +1051,12 @@ const run = async () => {
       return cmdGuard(rest);
     case 'hooks':
       return cmdHooks(rest);
+    case 'token':
+      return cmdToken(rest);
+    case 'tunnel':
+      return cmdTunnel(rest);
+    case 'connect':
+      return cmdConnect(rest);
     case 'port':
       return cmdPort(rest);
     case 'bar':

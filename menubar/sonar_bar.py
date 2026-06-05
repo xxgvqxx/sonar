@@ -105,24 +105,45 @@ def resolve_port() -> int:
 
 
 # --------------------------------------------------------------------------
+def resolve_token():
+    """Admin token from config.json, if set. Needed once the hub is in exposed mode (a tunnel
+    drops the loopback auth exemption, so even the local menu bar must present the token)."""
+    for p in (DATA_DIR / "config.json", CONFIG_PATH):
+        try:
+            t = json.loads(p.read_text()).get("token")
+            if t:
+                return str(t)
+        except Exception:
+            pass
+    return None
+
+
 class Hub:
     def __init__(self, port: int):
         self.base = f"http://127.0.0.1:{port}"
+        self.token = resolve_token()
+
+    def _headers(self, extra: dict | None = None):
+        h = dict(extra or {})
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token}"
+        return h
 
     def _get(self, path: str):
-        with urllib.request.urlopen(self.base + path, timeout=2.5) as r:
+        req = urllib.request.Request(self.base + path, headers=self._headers(), method="GET")
+        with urllib.request.urlopen(req, timeout=2.5) as r:
             return json.loads(r.read().decode())
 
     def _post(self, path: str, body: dict):
         req = urllib.request.Request(
             self.base + path, data=json.dumps(body).encode(),
-            headers={"content-type": "application/json"}, method="POST",
+            headers=self._headers({"content-type": "application/json"}), method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read().decode())
 
     def _delete(self, path: str):
-        req = urllib.request.Request(self.base + path, method="DELETE")
+        req = urllib.request.Request(self.base + path, headers=self._headers(), method="DELETE")
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read().decode())
 

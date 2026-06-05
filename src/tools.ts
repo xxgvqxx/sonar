@@ -169,10 +169,13 @@ const TOOL_GUIDE: { name: string; purpose: string; example: string }[] = [
   { name: 'spawn_worker', purpose: 'launch a new claude/codex session in an isolated git worktree, pre-joined to the link, to work a task and report back into the doc', example: 'spawn_worker(link_id="k7m2", task="investigate X and answer the open question", headless=true)' },
 ];
 
-export function registerTools(server: McpServer, opts: { remoteAddr?: string } = {}) {
+export function registerTools(server: McpServer, opts: { remoteAddr?: string; relay?: boolean } = {}) {
   // In LAN mode, host-mutating tools are refused for remote callers unless explicitly allowed.
   // (Local/loopback agents on the hub machine are always permitted; default loopback mode is unaffected.)
-  const remoteExecBlocked = () => LAN_MODE && !isLoopbackAddr(opts.remoteAddr) && !allowRemoteExec();
+  const remoteExecBlocked = () => (LAN_MODE && !isLoopbackAddr(opts.remoteAddr) && !allowRemoteExec()) || !!opts.relay;
+  // A relay session (a remote teammate authenticated with a per-member token) may use the coordination
+  // tools but NOT tools that read or run things on the hub host — its transcript index and its repos.
+  const hostPrivateBlocked = () => !!opts.relay;
 
   server.registerTool(
     'sonar_help',
@@ -195,7 +198,8 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
           `• Tasks can depend on others: a task with unfinished deps is "blocked" and refuses doing/done until they complete; finishing a task auto-unblocks anything waiting only on it.\n` +
           `• Enforcement you may hit: marking a task "done" can trigger an operator quality-gate (e.g. a test run) — if it fails you'll get the output back, so fix and retry. And if the operator installed the claim guard, a "git commit" touching a file another participant has claimed is blocked until you coordinate or they release it.\n` +
           `• doc_read is compact by default (Log trimmed, older entries archived); pass section="Log" or full=true for more.\n` +
-          `• Re-prompting a PAUSED agent in place is an operator action (shell: "sonar wake <link> <label> [prompt]"), not an MCP tool — it needs the session to be running under tmux.`
+          `• Re-prompting a PAUSED agent in place is an operator action (shell: "sonar wake <link> <label> [prompt]"), not an MCP tool — it needs the session to be running under tmux.\n` +
+          `• If you connected to a SHARED/REMOTE hub with a member token (a teammate across the network), you have the coordination tools only — search_context, recent_sessions, and spawn_worker are host-private and disabled for you. Exchange context through the shared doc instead.`
       );
     }
   );
@@ -376,6 +380,8 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
       },
     },
     async (a) => {
+      if (hostPrivateBlocked())
+        return text("search_context is disabled for relay/remote sessions — it searches the hub host's own Claude/Codex transcript history. Exchange context through the shared doc instead.");
       const hits = core.searchContext({
         query: a.query,
         branch: a.branch,
@@ -405,6 +411,7 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string } =
       inputSchema: { repo: z.string().optional(), branch: z.string().optional(), agent: z.string().optional(), limit: z.number().optional() },
     },
     async (a) => {
+      if (hostPrivateBlocked()) return text("recent_sessions is disabled for relay/remote sessions — it lists the hub host's own indexed sessions.");
       const rows = core.recentSessions(a);
       if (!rows.length) return text('No indexed sessions match.');
       return text(

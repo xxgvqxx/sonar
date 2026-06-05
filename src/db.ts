@@ -91,6 +91,18 @@ db.exec(`
     PRIMARY KEY (link_id, label)
   );
 
+  -- Per-member access tokens for remote (tunnel/LAN) callers. Only the sha-256 HASH is stored,
+  -- never the secret. revoked_at IS NULL == active. The single env/config SONAR_TOKEN still works
+  -- alongside these as the "admin" token.
+  CREATE TABLE IF NOT EXISTS auth_tokens (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    token_hash  TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at  TEXT
+  );
+
   -- Incremental tail state for each indexed JSONL log file.
   CREATE TABLE IF NOT EXISTS idx_files (
     path       TEXT PRIMARY KEY,

@@ -12,7 +12,8 @@ import * as docs from './docs.ts';
 import { spawnWorker, listWorktrees, pruneWorktree, listWorkers, stopWorker } from './spawn.ts';
 import { listPanes, wake } from './tmux.ts';
 import { startIndexer, reindexAll } from './indexer.ts';
-import { HOST, PORT, VERSION, PID_PATH, getToken, isLoopbackAddr, allowRemoteExec } from './config.ts';
+import * as tokens from './tokens.ts';
+import { HOST, PORT, VERSION, PID_PATH, getToken, isLoopbackAddr, allowRemoteExec, isExposed, setExposed } from './config.ts';
 
 /** Parse a query param as a finite number, else undefined (so NaN never reaches core/SQL/setTimeout). */
 function numQ(v: unknown): number | undefined {
@@ -23,11 +24,13 @@ function numQ(v: unknown): number | undefined {
 
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-function buildMcpServer(remoteAddr?: string): McpServer {
+function buildMcpServer(remoteAddr?: string, relay = false): McpServer {
   const server = new McpServer({ name: 'sonar', version: VERSION });
-  // Pass the connecting client's address so host-mutating tools (spawn_worker) can refuse remote
-  // callers in LAN mode — the in-process tool path doesn't otherwise see who is calling.
-  registerTools(server, { remoteAddr });
+  // Pass the connecting client's address + whether this is a RELAY session (authenticated with a
+  // per-member token, i.e. a remote teammate over a tunnel/LAN). Relay sessions get coordination
+  // tools only — host-private tools (search_context/recent_sessions/spawn_worker) are refused, since
+  // a tunnel makes a teammate look like loopback and IP alone can't tell them apart from the host.
+  registerTools(server, { remoteAddr, relay });
   return server;
 }
 
@@ -59,21 +62,46 @@ function requireLocalExec(req: Request, res: Response): boolean {
   return false;
 }
 
+/** Did this request present the ADMIN credential (the single env/config token), or is it a genuinely
+ *  local call on a non-exposed hub? Admin gates token management + the expose toggle. Note: in exposed
+ *  mode loopback alone is NOT trusted (a tunnel masquerades as loopback) — only the admin token is. */
+function isAdminReq(req: Request): boolean {
+  const single = getToken();
+  const supplied = suppliedToken(req);
+  if (single && supplied && tokenMatches(supplied, single)) return true;
+  if (isLoopbackAddr(req.socket.remoteAddress) && !isExposed()) return true;
+  return false;
+}
+function requireAdmin(req: Request, res: Response): boolean {
+  if (isAdminReq(req)) return true;
+  res.status(403).json({ error: 'admin only: run on the hub host or present the admin token (SONAR_TOKEN). Per-member tokens cannot manage the hub.' });
+  return false;
+}
+
 export function startServer() {
   const app = express();
   app.use(express.json({ limit: '8mb' }));
 
   // ---- auth (covers /mcp and /api, NOT /health) -------------------------------
-  // No token configured → allow everything (preserves the loopback-only, no-auth default).
-  // Token configured → loopback callers are exempt (local CLI + menu bar stay frictionless);
-  // remote callers must present the token via Authorization: Bearer or X-Sonar-Token.
+  // A request is authed if it presents the admin token (env/config SONAR_TOKEN) or any active
+  // per-member token. Modes:
+  //  • EXPOSED (tunnel / LAN): every caller must be authed — loopback is NOT exempt, because a
+  //    tunnel forwards external traffic to loopback and is otherwise indistinguishable from local.
+  //  • not exposed (default, loopback-only bind): local callers are exempt; a remote caller needs a
+  //    valid token, or is allowed only when no auth is configured at all (legacy open default).
   app.use(['/mcp', '/api'], (req: Request, res: Response, next: NextFunction) => {
-    const token = getToken();
-    if (!token) return next();
+    const supplied = suppliedToken(req);
+    const single = getToken();
+    const validSingle = !!(single && supplied && tokenMatches(supplied, single));
+    const authed = validSingle || (!!supplied && !!tokens.verifyToken(supplied));
+    if (isExposed()) {
+      if (authed) return next();
+      return res.status(401).json({ error: 'unauthorized: present a valid sonar token (Authorization: Bearer <token>)' });
+    }
     if (isLoopbackAddr(req.socket.remoteAddress)) return next();
-    const given = suppliedToken(req);
-    if (given && tokenMatches(given, token)) return next();
-    res.status(401).json({ error: 'unauthorized: set SONAR_TOKEN / Authorization: Bearer <token>' });
+    if (!single && !tokens.anyActive()) return next(); // legacy open default (loopback-only bind)
+    if (authed) return next();
+    res.status(401).json({ error: 'unauthorized: present a valid sonar token (Authorization: Bearer <token>)' });
   });
 
   // ---- MCP (Streamable HTTP) — one server connection per client session ----
@@ -92,7 +120,10 @@ export function startServer() {
       transport.onclose = () => {
         if (transport.sessionId) delete transports[transport.sessionId];
       };
-      await buildMcpServer(req.socket.remoteAddress).connect(transport);
+      // A session is "full" only if it presents the admin token or is a genuinely local call on a
+      // non-exposed hub; everything else (per-member token, any remote) is a coordination-only relay.
+      const relay = !isAdminReq(req);
+      await buildMcpServer(req.socket.remoteAddress, relay).connect(transport);
     } else {
       res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: no valid session ID' }, id: null });
       return;
@@ -121,7 +152,38 @@ export function startServer() {
     }
   };
 
-  app.get('/health', (_req, res) => res.json({ ok: true, version: VERSION, ...core.stats() }));
+  app.get('/health', (_req, res) => res.json({ ok: true, version: VERSION, exposed: isExposed(), ...core.stats() }));
+
+  // ---- admin: expose toggle + per-member token management (admin-only) ----
+  app.post(
+    '/api/admin/expose',
+    wrap((req, res) => {
+      if (!requireAdmin(req, res)) return;
+      setExposed(!!(req.body || {}).on);
+      res.json({ exposed: isExposed() });
+    })
+  );
+  app.get(
+    '/api/admin/tokens',
+    wrap((req, res) => {
+      if (!requireAdmin(req, res)) return;
+      res.json({ exposed: isExposed(), tokens: tokens.listTokens() });
+    })
+  );
+  app.post(
+    '/api/admin/tokens',
+    wrap((req, res) => {
+      if (!requireAdmin(req, res)) return;
+      res.json(tokens.createToken(String((req.body || {}).name || '')));
+    })
+  );
+  app.post(
+    '/api/admin/tokens/revoke',
+    wrap((req, res) => {
+      if (!requireAdmin(req, res)) return;
+      res.json(tokens.revokeToken(String((req.body || {}).token || '')));
+    })
+  );
 
   app.post(
     '/api/links',

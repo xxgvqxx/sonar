@@ -85,6 +85,20 @@ export function setToken(t: string): void {
   TOKEN = t;
 }
 
+/**
+ * "Exposed" mode: the hub is reachable by remote callers through a tunnel (cloudflared/ngrok) or a
+ * LAN bind. A tunnel forwards external traffic to loopback, so it is indistinguishable from a local
+ * call at the socket level — therefore in exposed mode the loopback auth exemption is DROPPED and
+ * every caller must present a valid token. Starts from SONAR_EXPOSED; `sonar tunnel` toggles it live.
+ */
+let EXPOSED = process.env.SONAR_EXPOSED === '1' || LAN_MODE;
+export function isExposed(): boolean {
+  return EXPOSED;
+}
+export function setExposed(v: boolean): void {
+  EXPOSED = v;
+}
+
 export const VERSION = '0.1.0';
 
 /** Transcript sources to index. */

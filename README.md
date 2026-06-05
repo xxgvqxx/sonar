@@ -134,6 +134,30 @@ The hub can run an operator‑defined command on coordination events and **block
 
 `task_completed` runs when an agent marks a task `done` (block = the task stays open and the command's output comes back as the reason); `task_created` runs when a task is added. Context arrives as env vars (`SONAR_EVENT`, `SONAR_LINK`, `SONAR_NUM`, `SONAR_TITLE`, `SONAR_FROM`). Hooks run **async** on the hub host so a slow gate never blocks other sessions; a gate that can't even start fails open (so a typo'd command doesn't wedge the board). `sonar hooks` prints the current config. (Tune the kill timeout with `SONAR_HOOK_TIMEOUT_MS`, default 120s.)
 
+## Across networks (remote teammates)
+
+The [LAN setup](#running-on-a-shared-network-lan) covers one office. For teammates in **different places**, expose the local hub through an **ephemeral tunnel** and hand each person a **revocable token** — no cloud deploy, nothing left standing.
+
+```bash
+sonar tunnel                # needs cloudflared (quick tunnels, no account) or ngrok installed
+```
+
+`sonar tunnel` ensures an **admin token** for this hub (so your own CLI / menu bar / agents keep working once it's exposed, and re-registers your Claude/Codex with it), mints a **per-member token** for the teammate, flips the hub into **exposed mode**, starts `cloudflared`/`ngrok`, and prints:
+
+```
+Public hub URL:  https://xxxx.trycloudflare.com/mcp
+Member token:    <token>   (name: guest-ab12)
+Teammate runs:   sonar connect https://xxxx.trycloudflare.com --token <token>
+```
+
+The teammate runs that `sonar connect …` (it points their Claude Code + Codex at your hub) and restarts their agent. Now both agents share the same links, shared doc, messages, claims, tasks, and git‑presence — across the internet. **Ctrl‑C** closes the tunnel and **revokes that member token** (keep it with `--keep-token`; `sonar tunnel off` just drops exposed mode).
+
+**Per‑member tokens.** `sonar token add <name>` / `sonar token list` / `sonar token revoke <name|token>` manage individually‑revocable credentials (only the sha‑256 hash is stored; the secret is shown once). Revoke one teammate without disturbing the others. The single `SONAR_TOKEN` (env/config) is the **admin** token — it manages the hub; per‑member tokens cannot.
+
+**Exposed mode & the security boundary.** A tunnel forwards external traffic to `127.0.0.1`, so it's indistinguishable from a local call — therefore in exposed mode the **loopback auth exemption is dropped** and every caller (including your own local tools) must present a token. And a teammate authenticated with a **member token gets a _relay_ session: coordination tools only** — `link_*`, `doc_*`, `post`/`wait`, `claim`/`release`, `task_*`, `git_sync`. The **host‑private** tools — `search_context`, `recent_sessions`, `spawn_worker` — are **refused** for relay sessions, since they read the hub host's own transcript index or run processes on the host. You (admin) keep full access.
+
+> Tunnels terminate TLS (https), so the token and content aren't sent in the clear — but only expose to people you trust on the link; the doc and messages carry your codebase context. For an **always‑on team hub** instead of an ephemeral tunnel, run this same hub on a small VM (Railway/Fly/Render) bound to `0.0.0.0` behind the platform's HTTPS, set `SONAR_TOKEN`, and start it with `SONAR_EXPOSED=1`; the per‑member‑token + relay model is identical. (Note: `search_context`/`spawn_worker` are inherently local to wherever the hub runs, so a cloud hub is a pure coordination relay.)
+
 ## Dispatch a worker
 
 Spawn a new agent, pre‑joined to a link, that works a task and writes back into the doc:
@@ -204,6 +228,9 @@ sonar start | stop | status    manage the background hub
 sonar daemon                   run the hub in the foreground
 sonar port <N|auto>            change the hub port (re-registers with Claude/Codex); "auto" picks a free one
 sonar invite                   print the LAN URL + token + paste-ready setup for a teammate on the same network
+sonar tunnel [--name <n>] [--provider cloudflared|ngrok] [--keep-token]   expose this hub via an ephemeral tunnel + mint a per-member token (Ctrl-C revokes it); "off" drops exposed mode
+sonar token add <name> | list | revoke <name|token>   manage revocable per-member access tokens
+sonar connect <hub-url> [--token <t>]   point THIS machine's Claude/Codex at a remote sonar hub
 
 sonar doc <id> [--open]        print / open a link's shared context doc
 sonar spawn <id> [claude|codex] <task…> [--headless]   dispatch a worker on a link
@@ -256,7 +283,8 @@ Environment variables (set before `sonar start`):
 | `SONAR_INDEX_DAYS` | `45` | only index transcripts modified within this many days |
 | `SONAR_INDEX_POLL_MS` | `4000` | how often transcripts are rescanned |
 | `SONAR_HOST` | `127.0.0.1` | bind address; set `0.0.0.0` to expose on the LAN |
-| `SONAR_TOKEN` | _(none)_ | shared access token required of remote callers (also read from `config.json`) |
+| `SONAR_TOKEN` | _(none)_ | **admin** token (also read from `config.json`); manages the hub. Per‑member tokens are added with `sonar token add` |
+| `SONAR_EXPOSED` | _(off)_ | start in exposed mode (require a token from every caller, incl. loopback); auto‑on under a LAN bind, and toggled live by `sonar tunnel` |
 | `SONAR_ALLOW_REMOTE_EXEC` | _(off)_ | permit code‑exec endpoints/tools for remote callers (off by default; only `1`/`true`/`yes`/`on` enable) |
 | `SONAR_HOOK_TIMEOUT_MS` | `120000` | max runtime for a quality‑gate hook before it's killed (and treated as a block) |
 | `SONAR_GUARD_OFF` | _(off)_ | when set, the pre‑commit claim guard skips its check (commit proceeds) |
@@ -315,6 +343,7 @@ sonar/
     tools.ts      MCP tool definitions
     core.ts       links, messages, long-poll waiters + read cursors, claims/tasks(+deps)/git-presence
     hooks.ts      operator quality-gate hooks (task_created/task_completed) run on the hub
+    tokens.ts     per-member revocable access tokens (hashed; for tunnel/remote callers)
     docs.ts       shared markdown doc read/append/section (compact + section reads, Log rotation→context.archive.md)
     spawn.ts      worker dispatch (git worktree + terminal/headless launch) + worker registry/status
     tmux.ts       launch sessions in tmux + wake a paused pane (send-keys, idle-gated)
