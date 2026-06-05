@@ -239,7 +239,7 @@ const SLASH_COMMAND = `---
 description: Link this session to other Claude Code / Codex sessions via sonar — collaborate through a shared doc, ask/answer across sessions, or dispatch a worker.
 ---
 
-You have the sonar MCP tools: link_create, link_join, doc_read, doc_append, doc_set_section, post, wait, read, search_context, spawn_worker. sonar coordinates multiple Claude Code / Codex sessions through a per-link SHARED MARKDOWN DOC that is the source of truth (both agents and the human read and edit it). Pings via post/wait just say "the doc changed".
+You have the sonar MCP tools: sonar_help (capabilities directory — call it if unsure which tool fits), link_create, link_join, link_list, doc_read, doc_append, doc_set_section, claim, release, task_add, task_update, git_sync, post, wait, read, search_context, spawn_worker. sonar coordinates multiple Claude Code / Codex sessions through a per-link SHARED MARKDOWN DOC that is the source of truth (both agents and the human read and edit it). Pings via post/wait just say "the doc changed".
 
 User argument (may be empty): "$ARGUMENTS"
 
@@ -253,6 +253,7 @@ INTERPRET THE ARGUMENT:
 - "search <text>"  → call search_context (add branch/repo filters if the user named one) and summarize the hits.
 - "doc <code>"  → call doc_read and show the user the doc.
 - "list"  → call link_list.
+- "tunnel" / "remote"  → the user wants to collaborate with a teammate on ANOTHER machine/network. This is an OPERATOR action, not a tool you call: tell them to run  sonar tunnel  in a terminal (it starts a background tunnel and prints a connect command + a revocable per-member token; the teammate runs that, and  sonar tunnel stop  ends it). Then collaborate over the link as usual.
 
 COLLABORATE (after joining):
 1. Summarize the returned doc for the user.
@@ -270,6 +271,8 @@ LISTEN LOOP — CRITICAL. Do NOT end your turn after one post/append:
 RULES:
 - ALWAYS surface to the user what the other agent said and what changed in the doc. Never go silent after posting.
 - Put substantive content in the DOC (doc_append), not just in chat pings.
+- Same repo as the other session? Use claim(resource, from) BEFORE editing a shared file (it returns a conflict instead of clobbering), the task board (task_add / task_update with status="doing"/"done", and depends_on to order work), and git_sync to share your branch / ahead-behind / changed files. All of these render into the doc.
+- If THIS session is on a REMOTE/shared hub (you connected with a member token via  sonar connect), you have coordination tools only — search_context, recent_sessions, and spawn_worker are host-local and will be refused; exchange everything through the shared doc.
 - Live back-and-forth requires the OTHER session to also be running /sonar <id> (or /sonar listen <id>) at the same time. If it is not, tell the user: your writes are saved and will be seen when it joins, but nobody replies until then — or suggest /sonar spawn <id> <task> to dispatch a worker that will respond.
 `;
 
@@ -297,11 +300,18 @@ Run  git branch --show-current  and  pwd  first. Use label "codex@<branch>", age
 ## Listen loop (critical — do not stop after one message)
 - wait(link_id, from="codex@<branch>", timeout_ms=30000). If messages arrive, tell the user verbatim and doc_read for the latest; handle anything for you. If it times out empty, call wait again. Loop several rounds. Always report to the user what arrived and what changed.
 
-## Dispatch / search
+## Coordinate the same repo
+- claim(link_id, resource, from) before editing a shared file — it returns a conflict (who holds it) instead of letting you clobber; release(...) when done.
+- task_add / task_update (status="doing"/"done", assignee, depends_on) — a shared board; finishing a task auto-unblocks its dependents.
+- git_sync(link_id, from, branch, ahead, behind, changed, files) — publish your tree and see the peers'. All of these surface in the doc (Claims / Tasks / Git).
+- sonar_help() — a capabilities directory (decision map + every tool) if you're unsure which to use.
+
+## Dispatch / search (host-local)
 - spawn_worker(link_id, task) — launch a new Claude/Codex session in an isolated git worktree that joins the link and works the task, writing back into the doc.
 - search_context(query, optional repo/branch/agent) — full-text search across BOTH Claude Code and Codex history (branch filter is exact only for Claude logs; filter Codex by repo).
 
-Live back-and-forth needs the other session active on the same link at the same time; otherwise writes are saved for when it joins, or use spawn_worker.
+## Remote teammates
+Live back-and-forth needs the other session active on the same link at the same time; otherwise writes are saved for when it joins, or use spawn_worker. To collaborate with a teammate on ANOTHER machine/network, the human runs  sonar tunnel  (operator action — prints a connect command + a revocable token). NOTE: if THIS session is connected to a remote/shared hub with a member token, you get coordination tools only — spawn_worker and search_context are host-local and will be refused; use the doc.
 `;
 }
 
@@ -376,10 +386,12 @@ function installCodex(url: string, token?: string): string {
 // Session-init awareness injected into every Claude/Codex session so it knows it
 // can spawn a worker / pull context from the start (not only after /sonar).
 const SESSION_INIT = `## sonar — multi-session coordination (available)
-A local **sonar** MCP server is running, letting you coordinate with other Claude Code / Codex sessions. When it helps, use it:
+A local **sonar** MCP server is running, letting you coordinate with other Claude Code / Codex sessions. When it helps, use it (call **sonar_help** for a full capabilities directory):
 - **spawn_worker(link_id, task)** — if a task has a separable part (investigate another area/repo, run a parallel subtask, reproduce something in isolation), call link_create then spawn_worker to launch a worker agent in an isolated git worktree that does it and reports back through the shared doc. (Guided flow: /sonar — Codex: the "sonar" skill.)
 - **search_context(query, repo?, branch?)** — pull relevant context from your OWN past sessions (Claude + Codex history) instead of asking the user to re-paste.
+- **Coordinating the same repo with another live session:** claim(resource) before editing a shared file (avoid clobbering), the task board (task_add / task_update, depends_on), and git_sync to share branch/diff state — all surface in the shared doc.
 - Each link has a shared doc at ~/.sonar/links/<id>/context.md that is the source of truth; collaborate via doc_append / doc_read, ping with post / wait.
+- **Across machines/networks:** the human can run \`sonar tunnel\` (operator action) to share this hub with a remote teammate over a revocable token; suggest it if they want to collaborate with someone not on this machine.
 Use this only when it genuinely helps — don't spawn workers for trivial tasks. If the sonar tools aren't listed, the hub may be down (run: sonar start).`;
 
 const CLAUDE_MD = path.join(os.homedir(), '.claude', 'CLAUDE.md');

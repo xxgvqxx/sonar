@@ -3,6 +3,7 @@
 Notable changes, newest first. Entries under **[Unreleased]** are auto-appended from commit subjects by `.githooks/post-commit` (enable in a clone with `git config core.hooksPath .githooks`); edit them freely and roll them under a version heading at release time.
 
 ## [Unreleased]
+- **2026-06-05** — Teach the agent commands about coordination + remote teammates
 - **2026-06-05** — Make the tunnel a managed background service (start/status/stop)
 - **2026-06-05** — Remote teammates: ephemeral tunnel + revocable per-member tokens
 - **2026-06-04** — Add claim enforcement, task dependencies, and quality-gate hooks
