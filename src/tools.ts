@@ -4,6 +4,9 @@ import * as core from './core.ts';
 import * as docs from './docs.ts';
 import { spawnWorker } from './spawn.ts';
 import { runHook } from './hooks.ts';
+import { fireWatches } from './watch.ts';
+import * as autopilot from './autopilot.ts';
+import { brief, formatBrief } from './brief.ts';
 import { LAN_MODE, isLoopbackAddr, allowRemoteExec } from './config.ts';
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
@@ -147,6 +150,9 @@ const DECISION_MAP: [need: string, use: string][] = [
   ['order work so one task waits for another', 'task_add(depends_on=[#…]) — it starts blocked and auto-unblocks when those are done'],
   ["see the other session's branch / ahead-behind / changed files", 'git_sync(from=…, branch=…, ahead=…, behind=…, changed=…, files=[…])'],
   ['dispatch an autonomous subtask that reports back', 'spawn_worker(task=…)  — headless=true to run in the background'],
+  ['be pinged/woken when something happens (an answer lands, a task finishes, a claim frees)', 'watch(event=…, arg?) — then go idle; the hub pings the link and wakes your tmux pane if it can'],
+  ['have the hub EXECUTE the task board itself (spawn/wake per ready task)', 'autopilot(on=true, cwd=…) — finish tasks with task_update(status="done") and dependents dispatch automatically'],
+  ['catch up on a repo at session start (last sessions, open questions, decisions, tasks)', 'brief(cwd=… or repo=…) — call it FIRST in a new session'],
   ['pull context from your OWN past Claude/Codex sessions', 'search_context(query=…, repo?/branch?/agent?)'],
   ['discover what links or sessions already exist', 'link_list / link_info / recent_sessions'],
 ];
@@ -167,6 +173,9 @@ const TOOL_GUIDE: { name: string; purpose: string; example: string }[] = [
   { name: 'search_context', purpose: 'full-text search YOUR indexed Claude + Codex history; filter by repo / branch / agent', example: 'search_context(query="rate limiting", repo="api")' },
   { name: 'recent_sessions', purpose: 'list recently indexed sessions to discover what context exists to search/link', example: 'recent_sessions(repo="api")' },
   { name: 'spawn_worker', purpose: 'launch a new claude/codex session in an isolated git worktree, pre-joined to the link, to work a task and report back into the doc', example: 'spawn_worker(link_id="k7m2", task="investigate X and answer the open question", headless=true)' },
+  { name: 'watch / unwatch', purpose: 'subscribe to an event (message, task_done #N, task_ready, answer, question, release <path>) — when it fires the hub posts a targeted ping and wakes your tmux pane if possible. Register, then go idle instead of polling', example: 'watch(link_id="k7m2", from="claude@feat/auth", event="task_done", arg="3")' },
+  { name: 'autopilot', purpose: 'turn the task board self-executing: every READY task is dispatched by the hub (assigned → wake that participant; unassigned → spawn a dedicated worker), capped, cascading through depends_on as tasks finish', example: 'autopilot(link_id="k7m2", from="claude@main", on=true, cwd="/path/to/repo", max=2, headless=true)' },
+  { name: 'brief', purpose: 'session-start catch-up for a repo: recent sessions, the tail of the last conversation, and every active link\'s open tasks/claims/questions/decisions', example: 'brief(cwd="/path/to/repo")' },
 ];
 
 export function registerTools(server: McpServer, opts: { remoteAddr?: string; relay?: boolean } = {}) {
@@ -197,6 +206,9 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
           `• Coordination state lives in the doc too: claim/release → "Claims" section, task_add/task_update → "Tasks", git_sync → "Git". So a single doc_read shows who holds which files, the task board, and each side's git state. Before editing a shared file, claim() it; before picking up work, read the Tasks section.\n` +
           `• Tasks can depend on others: a task with unfinished deps is "blocked" and refuses doing/done until they complete; finishing a task auto-unblocks anything waiting only on it.\n` +
           `• Enforcement you may hit: marking a task "done" can trigger an operator quality-gate (e.g. a test run) — if it fails you'll get the output back, so fix and retry. And if the operator installed the claim guard, a "git commit" touching a file another participant has claimed is blocked until you coordinate or they release it.\n` +
+          `• Instead of polling with wait(), you can watch(event=…) — the hub pings you (and wakes your tmux pane when possible) the moment it happens. Events: message, task_done (arg=#), task_ready (arg=#), answer, question, release (arg=path).\n` +
+          `• autopilot(on=true) makes the hub EXECUTE the board: ready tasks are dispatched automatically (assignee's pane woken, or a worker spawned per task), respecting depends_on and the quality gates. Add tasks with depends_on to script a pipeline, then let it run.\n` +
+          `• Starting fresh in a repo? brief(cwd=…) first — it returns recent sessions, the last conversation's tail, and open questions/decisions/tasks from active links, so you don't re-ask the human.\n` +
           `• doc_read is compact by default (Log trimmed, older entries archived); pass section="Log" or full=true for more.\n` +
           `• Re-prompting a PAUSED agent in place is an operator action (shell: "sonar wake <link> <label> [prompt]"), not an MCP tool — it needs the session to be running under tmux.\n` +
           `• If you connected to a SHARED/REMOTE hub with a member token (a teammate across the network), you have the coordination tools only — search_context, recent_sessions, and spawn_worker are host-private and disabled for you. Exchange context through the shared doc instead.`
@@ -293,9 +305,15 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
       if (!core.linkExists(a.link_id)) return text(`No link with id "${a.link_id}".`);
       const parts = core.listParticipants(a.link_id);
       const recent = core.readMessages({ linkId: a.link_id, limit: 10 });
+      const cfg = core.getAutopilot(a.link_id);
+      const watches = core.listWatches(a.link_id);
       return text(
         `Link ${a.link_id}\nParticipants:\n` +
           parts.map((p) => `- ${p.label} (${p.agent ?? '?'}${p.branch ? '/' + p.branch : ''}) · last seen ${fmtTime(p.last_seen)}`).join('\n') +
+          `\nAutopilot: ${cfg?.on ? `ON (max ${cfg.max ?? 2}, agent ${cfg.agent || 'claude'})` : 'off'}` +
+          (watches.length
+            ? `\nActive watches:\n` + watches.map((w) => `- #${w.id} ${w.label} ← ${w.event}${w.arg ? `(${w.arg})` : ''}${w.once ? '' : ' · persistent'}`).join('\n')
+            : '') +
           `\n\nRecent:\n${renderMessages(recent)}`
       );
     }
@@ -317,6 +335,7 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
     },
     async (a) => {
       const r = core.postMessage({ linkId: a.link_id, from: a.from, body: a.body, agent: a.agent, branch: a.branch, replyTo: a.reply_to });
+      await fireWatches({ linkId: a.link_id, event: 'message', from: a.from, detail: `message from ${a.from}: ${a.body.slice(0, 140)}` });
       return text(`Posted to ${a.link_id} as seq ${r.seq}. Call wait(link_id="${a.link_id}", from="${a.from}", after_seq=${r.seq}) to await a reply.` + pending(a.link_id, a.from));
     }
   );
@@ -462,6 +481,9 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
       docs.appendToSection(a.link_id, a.section, a.text, a.from);
       // Terse ping only — fires any wait() without re-duplicating the prose into the message stream.
       core.postMessage({ linkId: a.link_id, from: a.from, body: `📝 ${a.from} appended to "${a.section}"` });
+      const sec = a.section.trim().toLowerCase();
+      if (sec === 'answers') await fireWatches({ linkId: a.link_id, event: 'answer', from: a.from, detail: `${a.from} answered: ${a.text.slice(0, 140)}` });
+      if (sec === 'open questions') await fireWatches({ linkId: a.link_id, event: 'question', from: a.from, detail: `${a.from} asked: ${a.text.slice(0, 140)}` });
       return text(`Appended to "${a.section}" and pinged the link. Doc: ${docs.docPath(a.link_id)}` + pending(a.link_id, a.from));
     }
   );
@@ -532,7 +554,10 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
       if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
       const r = core.releaseClaim({ linkId: a.link_id, resource: a.resource, holder: a.from });
       syncClaims(a.link_id);
-      if (r.released) core.postMessage({ linkId: a.link_id, from: a.from, body: `🔓 ${a.from} released ${a.resource}` });
+      if (r.released) {
+        core.postMessage({ linkId: a.link_id, from: a.from, body: `🔓 ${a.from} released ${a.resource}` });
+        await fireWatches({ linkId: a.link_id, event: 'release', arg: a.resource, from: a.from, detail: `${a.from} released "${a.resource}" — it is free to claim` });
+      }
       return text(r.released ? `Released ${r.released} lease(s) on "${a.resource}".` : `No active lease by "${a.from}" on "${a.resource}".`);
     }
   );
@@ -566,11 +591,19 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
       }
       syncTasks(a.link_id);
       core.postMessage({ linkId: a.link_id, from: a.from, body: `🆕 task #${t.num}: ${t.title}${t.assignee ? ` → ${t.assignee}` : ''}${t.status === 'blocked' ? ' (blocked)' : ''}` });
+      let dispatched: autopilot.Dispatch[] = [];
+      if (t.status === 'todo') {
+        await fireWatches({ linkId: a.link_id, event: 'task_ready', arg: t.num, from: a.from, detail: `task #${t.num} "${t.title}" is ready` });
+        dispatched = await autopilot.dispatchReady(a.link_id, { trigger: `task #${t.num} added` });
+        syncTasks(a.link_id); // dispatch may have set assignees
+      }
       return text(
         `Added task #${t.num} "${t.title}" (${t.status}${t.assignee ? `, → ${t.assignee}` : ''}).\n` +
           (t.status === 'blocked'
             ? `It depends on ${a.depends_on?.map((n) => '#' + n).join(', ')} and will auto-unblock when those are done.`
-            : `Claim/progress it with task_update(link_id="${a.link_id}", num=${t.num}, from="${a.from}", status="doing", assignee="${a.from}"); finish with status="done".`) +
+            : dispatched.some((d) => d.num === t.num)
+              ? `Autopilot dispatched it (${dispatched.find((d) => d.num === t.num)!.via}${dispatched.find((d) => d.num === t.num)!.assignee ? ` → ${dispatched.find((d) => d.num === t.num)!.assignee}` : ''}).`
+              : `Claim/progress it with task_update(link_id="${a.link_id}", num=${t.num}, from="${a.from}", status="doing", assignee="${a.from}"); finish with status="done".`) +
           pending(a.link_id, a.from)
       );
     }
@@ -616,9 +649,24 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
       syncTasks(a.link_id);
       core.postMessage({ linkId: a.link_id, from: a.from, body: `📌 task #${t.num} → ${t.status}${t.assignee ? ` (${t.assignee})` : ''}` });
       if (r.unblocked.length) core.postMessage({ linkId: a.link_id, from: a.from, body: `🟢 unblocked ${r.unblocked.map((n) => '#' + n).join(', ')} (deps done)` });
+      // Event fan-out: watchers of this task's completion, watchers of each newly-ready task,
+      // then autopilot (which dispatches anything now ready, including the unblocked ones).
+      let dispatched: autopilot.Dispatch[] = [];
+      if (a.status === 'done') {
+        await fireWatches({ linkId: a.link_id, event: 'task_done', arg: t.num, from: a.from, detail: `task #${t.num} "${t.title}" was completed by ${a.from}` });
+      }
+      for (const n of r.unblocked) {
+        const ut = core.getTask(a.link_id, n);
+        await fireWatches({ linkId: a.link_id, event: 'task_ready', arg: n, from: a.from, detail: `task #${n} "${ut?.title ?? ''}" unblocked (deps done)` });
+      }
+      if (a.status === 'done' || a.status === 'todo') {
+        dispatched = await autopilot.dispatchReady(a.link_id, { trigger: `task #${t.num} → ${a.status}` });
+        if (dispatched.length) syncTasks(a.link_id);
+      }
       return text(
         `Task #${t.num} "${t.title}" is now ${t.status}${t.assignee ? ` · ${t.assignee}` : ''}.` +
           (r.unblocked.length ? ` Unblocked ${r.unblocked.map((n) => '#' + n).join(', ')}.` : '') +
+          (dispatched.length ? ` Autopilot dispatched: ${dispatched.map((d) => `#${d.num} (${d.error ? 'FAILED: ' + d.error : d.via})`).join(', ')}.` : '') +
           pending(a.link_id, a.from)
       );
     }
@@ -701,6 +749,123 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
       } catch (e) {
         return text(`Couldn't spawn worker: ${(e as Error).message}`);
       }
+    }
+  );
+
+  // ---- watches: event subscriptions ("wake me when …") ----
+  server.registerTool(
+    'watch',
+    {
+      title: 'Watch for an event (get pinged/woken)',
+      description:
+        'Subscribe to an event on this link instead of polling with wait(). When it fires, the hub posts a targeted ping to the link (your next wait()/read sees it) and — if your session runs in a sonar tmux pane — types a wake prompt into it so you resume automatically. ' +
+        'Events: "message" (any new post), "task_done" (arg = task # — or omit for any), "task_ready" (a task becomes workable), "answer" (something appended to Answers), "question" (appended to Open questions), "release" (arg = a path you are waiting on; overlap-aware like claims). ' +
+        'One-shot by default; pass once=false to keep it active after each fire. Your own actions never trigger your own watches.',
+      inputSchema: {
+        link_id: z.string(),
+        from: z.string().describe('Your participant label (who to ping/wake).'),
+        event: z.enum(['message', 'task_done', 'task_ready', 'answer', 'question', 'release']),
+        arg: z.string().optional().describe('Scope: task number for task_* events, a path for release. Omit to match any.'),
+        note: z.string().optional().describe('Why you are watching (shown to whoever looks at the watch list).'),
+        once: z.boolean().optional().describe('Default true = fires once then deactivates. false = persistent.'),
+      },
+    },
+    async (a) => {
+      if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
+      const w = core.addWatch({ linkId: a.link_id, label: a.from, event: a.event, arg: a.arg, note: a.note, once: a.once });
+      return text(
+        `Watch #${w.id} armed: ${a.event}${a.arg ? `(${a.arg})` : ''} → ping ${a.from}${w.once ? ' (one-shot)' : ' (persistent)'}.\n` +
+          `You can now end your turn / go idle — the hub will ping the link (and wake your tmux pane if it can) when it fires. ` +
+          `Cancel with unwatch(link_id="${a.link_id}", from="${a.from}", id=${w.id}).` +
+          pending(a.link_id, a.from)
+      );
+    }
+  );
+
+  server.registerTool(
+    'unwatch',
+    {
+      title: 'Cancel a watch',
+      description: 'Remove one of your event subscriptions (by id), or all of them on the link (omit id).',
+      inputSchema: {
+        link_id: z.string(),
+        from: z.string().describe('Your participant label.'),
+        id: z.number().optional().describe('The watch id to remove; omit to remove all of yours on this link.'),
+      },
+    },
+    async (a) => {
+      if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
+      const n = core.removeWatch({ linkId: a.link_id, id: a.id, label: a.id == null ? a.from : undefined });
+      return text(n ? `Removed ${n} watch(es).` : 'No matching watch.');
+    }
+  );
+
+  // ---- autopilot: the self-executing task board ----
+  server.registerTool(
+    'autopilot',
+    {
+      title: 'Autopilot — self-executing task board',
+      description:
+        'Turn the link\'s task board into an execution engine. While ON, the hub dispatches every READY task itself: a task with an assignee → that participant is pinged and their tmux pane woken; an unassigned task → a dedicated worker is spawned in an isolated worktree to claim it, work it, and mark it done. ' +
+        'Completions cascade — finishing a task auto-unblocks its depends_on dependents, which are then dispatched too (bounded by max concurrent, default 2; quality-gate hooks still guard every "done"). ' +
+        'To script a pipeline: add tasks with depends_on, enable autopilot, watch the doc. Call with on omitted to see current status. Re-arm a stuck task by setting it back to status="todo".',
+      inputSchema: {
+        link_id: z.string(),
+        from: z.string().describe('Your participant label.'),
+        on: z.boolean().optional().describe('true = enable, false = disable. Omit to just show status.'),
+        cwd: z.string().optional().describe('Repo/dir workers are based on (worktrees branch from here). REQUIRED when enabling — pass your repo root.'),
+        agent: z.enum(['claude', 'codex']).optional().describe('CLI for spawned workers (default claude).'),
+        max: z.number().optional().describe('Max tasks in flight at once (default 2, max 8).'),
+        headless: z.boolean().optional().describe('Spawn workers headless (background) instead of visible terminals. Default false.'),
+      },
+    },
+    async (a) => {
+      if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
+      if (a.on === undefined) {
+        const cfg = core.getAutopilot(a.link_id);
+        const inflight = core.inflightTasks(a.link_id);
+        const ready = core.readyTasks(a.link_id);
+        return text(
+          `Autopilot on ${a.link_id}: ${cfg?.on ? `ON (agent ${cfg.agent || 'claude'}, max ${cfg.max ?? 2}${cfg.headless ? ', headless' : ''}${cfg.cwd ? `, cwd ${cfg.cwd}` : ''})` : 'off'}\n` +
+            `In flight: ${inflight.length ? inflight.map((t) => `#${t.num} (${t.status}${t.assignee ? ` · ${t.assignee}` : ''})`).join(', ') : 'none'}\n` +
+            `Ready (undispatched): ${ready.length ? ready.map((t) => `#${t.num}`).join(', ') : 'none'}`
+        );
+      }
+      if (a.on && remoteExecBlocked()) {
+        return text('autopilot is disabled for remote/relay callers — it spawns workers on the hub host. Ask the hub operator to enable it (or set SONAR_ALLOW_REMOTE_EXEC=1).');
+      }
+      if (a.on && !a.cwd) return text('Pass cwd=<your repo root> when enabling autopilot — workers need a repo to base their worktrees on.');
+      const r = await autopilot.setAutopilot(a.link_id, a.on ? { on: true, cwd: a.cwd, agent: a.agent, max: a.max, headless: a.headless, by: a.from } : { on: false });
+      if (!a.on) return text('Autopilot OFF — tasks are no longer auto-dispatched (running workers finish their current task).');
+      return text(
+        `Autopilot ON (max ${r.config?.max ?? 2} in flight, agent ${r.config?.agent || 'claude'}${r.config?.headless ? ', headless' : ''}).\n` +
+          (r.dispatched.length
+            ? `Dispatched now: ${r.dispatched.map((d) => `#${d.num} (${d.error ? 'FAILED: ' + d.error : d.via}${d.assignee ? ` → ${d.assignee}` : ''})`).join(', ')}.`
+            : 'Nothing ready yet — add tasks (use depends_on to order them) and they will dispatch as they become ready.') +
+          `\nEvery "done" still passes your quality-gate hooks; watch progress in the doc or the menu bar.` +
+          pending(a.link_id, a.from)
+      );
+    }
+  );
+
+  // ---- brief: session-start catch-up ----
+  server.registerTool(
+    'brief',
+    {
+      title: 'Brief — catch up on a repo at session start',
+      description:
+        "Call this FIRST when starting work in a repo. Returns a briefing assembled from the hub's memory: recent Claude/Codex sessions in the repo, the tail of the most recent conversation, and — for every active link involving the repo — open tasks, held claims, open questions, and recorded decisions. Saves the human from re-pasting context you already have.",
+      inputSchema: {
+        cwd: z.string().optional().describe('Your working directory (repo is derived from its git root). Pass this normally.'),
+        repo: z.string().optional().describe('Repo name override (basename of the git root), if cwd is not enough.'),
+        branch: z.string().optional().describe('Restrict recent-session list to a branch.'),
+        days: z.number().optional().describe('How far back to look for active links (default 14).'),
+      },
+    },
+    async (a) => {
+      if (hostPrivateBlocked())
+        return text("brief is disabled for relay/remote sessions — it reads the hub host's transcript index. Use doc_read on the shared link instead.");
+      return text(formatBrief(brief({ repo: a.repo, cwd: a.cwd, branch: a.branch, days: a.days })));
     }
   );
 }

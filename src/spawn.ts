@@ -43,9 +43,10 @@ async function gitRoot(cwd: string): Promise<string | null> {
   }
 }
 
-function workerPrompt(opts: { linkId: string; agent: string; task: string; cwd: string; branch?: string }): string {
+function workerPrompt(opts: { linkId: string; agent: string; task: string; cwd: string; branch?: string; label?: string }): string {
+  const label = opts.label || `${opts.agent}@worker`;
   return [
-    `You are a sonar WORKER agent (label "${opts.agent}@worker"). You were spawned to collaborate with other Claude Code / Codex sessions through the sonar hub (MCP server "sonar", ${MCP_URL}).`,
+    `You are a sonar WORKER agent (label "${label}"). You were spawned to collaborate with other Claude Code / Codex sessions through the sonar hub (MCP server "sonar", ${MCP_URL}).`,
     ``,
     `Link: ${opts.linkId}`,
     `Shared doc: ${docPath(opts.linkId)}`,
@@ -55,12 +56,12 @@ function workerPrompt(opts: { linkId: string; agent: string; task: string; cwd: 
     opts.task,
     ``,
     `PROTOCOL — follow this exactly:`,
-    `1. Call link_join (link_id="${opts.linkId}", label="${opts.agent}@worker", agent="${opts.agent}", cwd="${opts.cwd}"${opts.branch ? `, branch="${opts.branch}"` : ''}).`,
+    `1. Call link_join (link_id="${opts.linkId}", label="${label}", agent="${opts.agent}", cwd="${opts.cwd}"${opts.branch ? `, branch="${opts.branch}"` : ''}).`,
     `2. Call doc_read (link_id="${opts.linkId}") to load shared context and any Open questions.`,
-    `3. Immediately post(link_id="${opts.linkId}", from="${opts.agent}@worker", body="▶ starting: <one-line plan>") so the human and other agents know you're alive and what you're about to do.`,
+    `3. Immediately post(link_id="${opts.linkId}", from="${label}", body="▶ starting: <one-line plan>") so the human and other agents know you're alive and what you're about to do.`,
     `4. Work the task in CHECKPOINTS. This may run for many minutes — do NOT go silent for long stretches:`,
-    `   • After each meaningful step (and at least every few minutes on long work), post(...) a one-line progress update, and append substantive findings to the doc with doc_append (section="Answers"/"Context"/"Decisions", from="${opts.agent}@worker").`,
-    `   • At each checkpoint also do a quick wait(link_id="${opts.linkId}", from="${opts.agent}@worker", timeout_ms=2000) (or read) to pick up any new instructions or redirection from the other agent / human, and re-read the doc if pinged. Don't run 15+ minutes without checking in.`,
+    `   • After each meaningful step (and at least every few minutes on long work), post(...) a one-line progress update, and append substantive findings to the doc with doc_append (section="Answers"/"Context"/"Decisions", from="${label}").`,
+    `   • At each checkpoint also do a quick wait(link_id="${opts.linkId}", from="${label}", timeout_ms=2000) (or read) to pick up any new instructions or redirection from the other agent / human, and re-read the doc if pinged. Don't run 15+ minutes without checking in.`,
     `5. If you get blocked, add the question with doc_append (section="Open questions", ...), post(...) a one-line ping, then wait() in a loop for the answer.`,
     `6. When finished, append a short summary to the doc (section "Decisions"/"Answers") and post a final "✅ done: <summary>". If you fail or give up, post "✖ failed: <reason>" so watchers aren't left hanging.`,
     ``,
@@ -96,6 +97,8 @@ export async function spawnWorker(opts: {
   headless?: boolean;
   terminal?: string;
   dryRun?: boolean;
+  /** Participant label the worker joins as (default "<agent>@worker") — e.g. "claude@task-3". */
+  label?: string;
 }) {
   const agent = opts.agent || 'claude';
   const baseCwd = opts.cwd || process.cwd();
@@ -126,7 +129,7 @@ export async function spawnWorker(opts: {
   const workerId = `${opts.linkId}-${suffix}`;
   const ctrlDir = path.join(WORKERS, workerId);
   fs.mkdirSync(ctrlDir, { recursive: true });
-  const prompt = workerPrompt({ linkId: opts.linkId, agent, task: opts.task, cwd: workdir, branch });
+  const prompt = workerPrompt({ linkId: opts.linkId, agent, task: opts.task, cwd: workdir, branch, label: opts.label });
   const promptFile = path.join(ctrlDir, 'prompt.txt');
   fs.writeFileSync(promptFile, prompt);
 
@@ -142,6 +145,7 @@ export async function spawnWorker(opts: {
       id: workerId,
       link_id: opts.linkId,
       agent,
+      label: opts.label || `${agent}@worker`,
       task: opts.task.slice(0, 280),
       workdir,
       branch: branch ?? null,
@@ -176,7 +180,7 @@ export async function spawnWorker(opts: {
   fs.chmodSync(launcher, 0o755);
   const terminal = opts.terminal || readTerminalPref();
   const launchCmd = `zsh ${q(launcher)}`;
-  const label = `${agent}@worker`;
+  const label = opts.label || `${agent}@worker`;
 
   // tmux mode: launch in a named tmux window so sonar can wake/talk to the live pane.
   if (terminal === 'tmux' && (await tmuxAvailable())) {

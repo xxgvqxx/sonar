@@ -9,6 +9,9 @@ import { registerTools } from './tools.ts';
 import * as core from './core.ts';
 import * as sessions from './sessions.ts';
 import * as docs from './docs.ts';
+import { fireWatches } from './watch.ts';
+import * as autopilot from './autopilot.ts';
+import { brief, formatBrief } from './brief.ts';
 import { spawnWorker, listWorktrees, pruneWorktree, listWorkers, stopWorker } from './spawn.ts';
 import { listPanes, wake } from './tmux.ts';
 import { startIndexer, reindexAll } from './indexer.ts';
@@ -216,9 +219,11 @@ export function startServer() {
 
   app.post(
     '/api/links/:id/messages',
-    wrap((req, res) => {
+    wrap(async (req, res) => {
       const b = req.body || {};
-      res.json(core.postMessage({ linkId: req.params.id, from: b.from || 'anon', body: b.body || '', agent: b.agent, branch: b.branch, replyTo: b.reply_to }));
+      const r = core.postMessage({ linkId: req.params.id, from: b.from || 'anon', body: b.body || '', agent: b.agent, branch: b.branch, replyTo: b.reply_to });
+      await fireWatches({ linkId: req.params.id, event: 'message', from: b.from || 'anon', detail: `message from ${b.from || 'anon'}: ${String(b.body || '').slice(0, 140)}` });
+      res.json(r);
     })
   );
 
@@ -314,12 +319,87 @@ export function startServer() {
 
   app.post(
     '/api/links/:id/doc/append',
-    wrap((req, res) => {
+    wrap(async (req, res) => {
       if (!core.linkExists(req.params.id)) return res.status(404).json({ error: 'no such link' });
       const b = req.body || {};
       docs.appendToSection(req.params.id, b.section || 'Log', b.text || '', b.from);
       if (b.from) core.postMessage({ linkId: req.params.id, from: b.from, body: `📝 updated doc → ${b.section}` });
+      const sec = String(b.section || '').trim().toLowerCase();
+      if (b.from && sec === 'answers')
+        await fireWatches({ linkId: req.params.id, event: 'answer', from: b.from, detail: `${b.from} answered: ${String(b.text || '').slice(0, 140)}` });
+      if (b.from && sec === 'open questions')
+        await fireWatches({ linkId: req.params.id, event: 'question', from: b.from, detail: `${b.from} asked: ${String(b.text || '').slice(0, 140)}` });
       res.json({ ok: true, path: docs.docPath(req.params.id) });
+    })
+  );
+
+  // ---- watches (event subscriptions) ----
+  app.get(
+    '/api/links/:id/watches',
+    wrap((req, res) => {
+      if (!core.linkExists(req.params.id)) return res.status(404).json({ error: 'no such link' });
+      res.json(core.listWatches(req.params.id, { all: req.query.all === '1' }));
+    })
+  );
+
+  app.post(
+    '/api/links/:id/watches',
+    wrap((req, res) => {
+      if (!core.linkExists(req.params.id)) return res.status(404).json({ error: 'no such link' });
+      const b = req.body || {};
+      res.json(core.addWatch({ linkId: req.params.id, label: b.label || 'anon', event: b.event, arg: b.arg, note: b.note, once: b.once }));
+    })
+  );
+
+  app.delete(
+    '/api/links/:id/watches/:watchId',
+    wrap((req, res) => {
+      res.json({ removed: core.removeWatch({ linkId: req.params.id, id: Number(req.params.watchId) }) });
+    })
+  );
+
+  // ---- autopilot (self-executing task board) ----
+  app.get(
+    '/api/links/:id/autopilot',
+    wrap((req, res) => {
+      if (!core.linkExists(req.params.id)) return res.status(404).json({ error: 'no such link' });
+      res.json({ config: core.getAutopilot(req.params.id), inflight: core.inflightTasks(req.params.id), ready: core.readyTasks(req.params.id) });
+    })
+  );
+
+  app.post(
+    '/api/links/:id/autopilot',
+    wrap(async (req, res) => {
+      if (!requireLocalExec(req, res)) return; // dispatch spawns workers on the hub host
+      if (!core.linkExists(req.params.id)) return res.status(404).json({ error: 'no such link' });
+      const b = req.body || {};
+      if (b.on && !b.cwd) return res.status(400).json({ error: 'cwd required when enabling autopilot (repo root for worker worktrees)' });
+      const r = await autopilot.setAutopilot(req.params.id, b.on ? { on: true, cwd: b.cwd, agent: b.agent, max: b.max, headless: b.headless, by: b.by } : { on: false });
+      res.json(r);
+    })
+  );
+
+  // Manual dispatch pass (also lets a human re-kick after re-arming a task).
+  app.post(
+    '/api/links/:id/dispatch',
+    wrap(async (req, res) => {
+      if (!requireLocalExec(req, res)) return;
+      if (!core.linkExists(req.params.id)) return res.status(404).json({ error: 'no such link' });
+      res.json({ dispatched: await autopilot.dispatchReady(req.params.id, { trigger: 'manual dispatch' }) });
+    })
+  );
+
+  // ---- brief (session-start catch-up) ----
+  app.get(
+    '/api/brief',
+    wrap((req, res) => {
+      const b = brief({
+        repo: req.query.repo as string | undefined,
+        cwd: req.query.cwd as string | undefined,
+        branch: req.query.branch as string | undefined,
+        days: numQ(req.query.days),
+      });
+      res.json({ ...b, text: formatBrief(b) });
     })
   );
 

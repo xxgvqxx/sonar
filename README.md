@@ -124,6 +124,36 @@ sonar guard install --link <id> --label bob --hub http://<hub-ip>:7610 [--token 
 
 Before each commit the hook checks the staged files against the link's active leases; if any file is claimed by **another** participant, the commit is **blocked** with who holds it and until when. It **fails open** — if the hub is unreachable, no link/label is configured, or anything errors, the commit proceeds (the guard never breaks a normal commit). Bypass once with `git commit --no-verify` (or `SONAR_GUARD_OFF=1`). `sonar guard status` shows config; `sonar guard uninstall` removes it. Link/label/hub are stored in the repo's `git config` (`sonar.link`, `sonar.label`, `sonar.hub`), and the hook respects an existing `core.hooksPath`.
 
+### Autopilot — the board executes itself
+
+The task board doesn't have to wait for agents to poll it. Turn on **autopilot** and the hub dispatches every **ready** task (status `todo`, unblocked, not yet dispatched) on its own:
+
+- a task **with an assignee** → that participant is pinged on the link and, if their session runs in a sonar tmux pane, **woken** to claim it;
+- an **unassigned** task → a dedicated **worker** is spawned in an isolated worktree whose whole mission is that one task: claim it (`status="doing"`), work it, verify, mark it `done`.
+
+Completions cascade: `done` auto-unblocks dependents (`depends_on`), which autopilot dispatches next — so a dependency graph **runs itself**, bounded by a concurrency cap (default 2 in flight, max 8) and still gated by your [quality-gate hooks](#quality-gates-hooks) at every `done`. Script a pipeline as tasks, enable autopilot, watch the doc.
+
+```
+task_add(title="Write the migration")                          # 1
+task_add(title="Backfill the data", depends_on=[1])            # 2
+task_add(title="Flip the feature flag", depends_on=[2])        # 3
+autopilot(link_id, from=…, on=true, cwd="/path/to/repo")       # 1 dispatches now; 2 and 3 follow as deps finish
+```
+
+From the shell: `sonar autopilot <id> on [--agent claude|codex] [--max N] [--headless]` (uses your current directory as the worker repo), `… status`, `… off`. Guardrails: `dispatched_at` prevents double-dispatch, resetting a task to `todo` re-arms it, spawn failures re-arm automatically, and `off` stops future dispatch without killing running workers. Set `SONAR_AUTOPILOT_DRY=1` on the hub to dry-run dispatch (no real processes — used by the e2e test).
+
+### Watches — get pinged (and woken) on events
+
+`wait()` is a poll; a **watch** is a standing order: *"tell me when X happens, then I'll act."* An agent registers one and goes idle — when the event fires, the hub posts a targeted 📣 ping on the link (any `wait()` loop or unread-nudge sees it) **and**, if the subscriber's session lives in a sonar tmux pane, types a wake prompt straight into it (same idle-gate + loop-cap as `sonar wake`).
+
+```
+watch(link_id, from="claude@feat/auth", event="task_done", arg="3")   # wake me when #3 finishes
+watch(link_id, from="codex@main", event="release", arg="shared/types.ts")  # …when that file frees up
+watch(link_id, from="claude@feat/auth", event="answer")               # …when anyone answers
+```
+
+Events: `message` (any new post), `task_done` / `task_ready` (arg = task #, or omit for any), `answer` / `question` (doc sections), `release` (arg = a path; overlap-aware like claims). One-shot by default (`once=false` for persistent); your own actions never trigger your own watches. Manage from the shell with `sonar watches <id> [rm <watchId>]`.
+
 ### Quality gates (hooks)
 
 The hub can run an operator‑defined command on coordination events and **block** the operation on a non‑zero exit — e.g. require tests to pass before a task can be marked done. Configure `~/.sonar/hooks.json`:
@@ -197,6 +227,16 @@ recent_sessions(repo="api")           # see what sessions are indexed
 
 …or from the shell: `sonar search "auth refactor"`.
 
+### Brief — catch up at session start
+
+One call that answers *"where were we?"* for a repo, assembled from everything the hub already knows:
+
+```
+brief(cwd="/path/to/repo")     # or:  sonar brief   (from inside the repo)
+```
+
+returns the **recent sessions** in that repo (from the transcript index), the **tail of the most recent conversation** (what "last time" was about, with a pointer to `search_context` for digging deeper), and — for every **active link** whose participants are in the repo — its open tasks, held claims, open questions, recorded decisions, and whether autopilot is on. The session-init block installed by `sonar install` tells every new Claude/Codex session to call `brief` before substantive work, so continuity stops depending on the human re-pasting context.
+
 ---
 
 ## Menu bar app (macOS)
@@ -236,6 +276,10 @@ sonar token add <name> | list | revoke <name|token>   manage revocable per-membe
 sonar connect <hub-url> [--token <t>]   point THIS machine's Claude/Codex at a remote sonar hub
 
 sonar doc <id> [--open]        print / open a link's shared context doc
+sonar brief [repo]             session-start catch-up: recent sessions + open questions/tasks/decisions
+sonar autopilot <id> on|off|status [--agent claude|codex] [--max N] [--headless]
+                               self-executing task board — the hub dispatches every ready task
+sonar watches <id> [rm <n>]    list / remove event subscriptions on a link
 sonar spawn <id> [claude|codex] <task…> [--headless]   dispatch a worker on a link
 sonar wake <id> <label> [message…] [--force]   type a prompt into a live tmux pane to make a paused agent run again
 sonar attach                   attach to the sonar tmux session to watch agent panes
@@ -270,6 +314,9 @@ sonar bar [fg]                 launch the macOS menu-bar app
 | `task_add` / `task_update` | shared todo/doing/done/blocked board (assignee, note, `depends_on` with auto‑unblock); `task_update` claims (`status="doing"`) or finishes (`status="done"`); surfaces in the doc **Tasks** |
 | `git_sync` | report your branch / ahead‑behind / changed files and get the peers' back (agent‑reported, so it works cross‑machine); surfaces in the doc **Git** |
 | `spawn_worker` | launch a Claude/Codex worker in an isolated worktree, joined to the link (runs on the hub host; remote callers gated by `SONAR_ALLOW_REMOTE_EXEC`) |
+| `watch` / `unwatch` | subscribe to an event (`message`, `task_done`/`task_ready` [arg=#], `answer`, `question`, `release` [arg=path]) — on fire the hub posts a targeted 📣 ping and wakes the subscriber's tmux pane when possible; one‑shot by default |
+| `autopilot` | per‑link self‑executing task board: every ready task is dispatched (assignee woken, or a dedicated worker spawned), cascading through `depends_on`, capped (default 2 in flight); call with `on` omitted for status |
+| `brief` | session‑start catch‑up for a repo: recent sessions, last conversation's tail, and each active link's open tasks / claims / questions / decisions |
 | `post` / `read` | send / read "doc changed" pings |
 | `wait` | long‑poll until the link changes (or timeout); per‑participant cursor so a loop blocks correctly |
 | `search_context` | FTS over indexed Claude + Codex history; filter by repo / branch / agent |
@@ -290,6 +337,7 @@ Environment variables (set before `sonar start`):
 | `SONAR_EXPOSED` | _(off)_ | start in exposed mode (require a token from every caller, incl. loopback); auto‑on under a LAN bind, and toggled live by `sonar tunnel` |
 | `SONAR_ALLOW_REMOTE_EXEC` | _(off)_ | permit code‑exec endpoints/tools for remote callers (off by default; only `1`/`true`/`yes`/`on` enable) |
 | `SONAR_HOOK_TIMEOUT_MS` | `120000` | max runtime for a quality‑gate hook before it's killed (and treated as a block) |
+| `SONAR_AUTOPILOT_DRY` | _(off)_ | autopilot dispatch becomes a dry‑run (no processes launched) — safe mode / used by `npm run test:e2e` |
 | `SONAR_GUARD_OFF` | _(off)_ | when set, the pre‑commit claim guard skips its check (commit proceeds) |
 
 **Port resolution:** `SONAR_PORT` env → `~/.sonar/config.json` (written by `sonar port`) → `7610`. If the port is taken, `sonar install` automatically falls back to the next free one, and `sonar start` points you to `sonar port auto`. Changing the port **re-registers the MCP URL** with Claude Code and Codex and the menu bar follows it automatically — so it stays consistent everywhere.
@@ -344,7 +392,10 @@ sonar/
     cli.ts        CLI + daemon lifecycle + install
     server.ts     HTTP server: MCP (/mcp) + REST (/api/*)
     tools.ts      MCP tool definitions
-    core.ts       links, messages, long-poll waiters + read cursors, claims/tasks(+deps)/git-presence
+    core.ts       links, messages, long-poll waiters + read cursors, claims/tasks(+deps)/git-presence, watches + autopilot config
+    watch.ts      watch delivery: fire matching subscriptions (targeted ping + best-effort tmux wake)
+    autopilot.ts  self-executing task board: dispatch ready tasks (spawn a worker / wake the assignee), capped + cascading
+    brief.ts      session-start briefing: recent sessions + last-conversation tail + active links' state for a repo
     hooks.ts      operator quality-gate hooks (task_created/task_completed) run on the hub
     tokens.ts     per-member revocable access tokens (hashed; for tunnel/remote callers)
     docs.ts       shared markdown doc read/append/section (compact + section reads, Log rotation→context.archive.md)
@@ -358,6 +409,8 @@ sonar/
     sonar_bar.py  native menu-bar host (PyObjC: NSStatusItem + NSPopover + WKWebView)
     ui.html       the menu-bar UI (auto light/dark)
     pyproject.toml
+  test/
+    e2e.mjs       smoke test: isolated hub + real MCP/REST calls (watches, autopilot dry-run, brief) — npm run test:e2e
   .githooks/
     post-commit   auto-appends commit subjects to CHANGELOG.md
   CHANGELOG.md

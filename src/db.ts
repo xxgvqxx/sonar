@@ -75,6 +75,22 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_tasks_link ON tasks (link_id, num);
 
+  -- Event subscriptions: "ping me (and wake my pane if you can) when X happens on this link".
+  -- once=1 → deactivated after first fire (triggered_at set); once=0 → persistent.
+  CREATE TABLE IF NOT EXISTS watches (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    link_id    TEXT NOT NULL,
+    label      TEXT NOT NULL,
+    event      TEXT NOT NULL,
+    arg        TEXT,
+    note       TEXT,
+    once       INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    triggered_at TEXT,
+    fire_count INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_watches_link ON watches (link_id, event);
+
   -- Latest git snapshot each participant reports. Agent-reported (not hub-derived) so it
   -- works cross-machine — the hub can't see a remote teammate's working tree.
   CREATE TABLE IF NOT EXISTS git_state (
@@ -136,7 +152,13 @@ db.exec(`
 // Idempotent migrations for columns added after a table first shipped (CREATE TABLE IF NOT
 // EXISTS won't alter an existing table). Each ALTER throws "duplicate column" once applied —
 // swallow that so startup stays clean on an already-migrated db.
-for (const stmt of ['ALTER TABLE tasks ADD COLUMN deps TEXT']) {
+for (const stmt of [
+  'ALTER TABLE tasks ADD COLUMN deps TEXT',
+  // when autopilot (or a watch ping) has already dispatched a ready task, so it isn't re-dispatched
+  'ALTER TABLE tasks ADD COLUMN dispatched_at TEXT',
+  // per-link autopilot config as JSON ({"on":true,"agent":"claude","cwd":"…","max":2,"headless":true}) or NULL = off
+  'ALTER TABLE links ADD COLUMN autopilot TEXT',
+]) {
   try {
     db.exec(stmt);
   } catch {

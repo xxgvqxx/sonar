@@ -325,7 +325,7 @@ function normResource(r: string): string {
 }
 
 /** Two resources conflict if equal, or one is a path-prefix of the other (a dir covers its files). */
-function resourcesOverlap(a: string, b: string): boolean {
+export function resourcesOverlap(a: string, b: string): boolean {
   const x = normResource(a);
   const y = normResource(b);
   if (x === y) return true;
@@ -527,8 +527,119 @@ export function updateTask(opts: {
      WHERE link_id = ? AND num = ?`
   ).run(status ?? null, opts.assignee ?? null, opts.note ?? null, deps.length ? JSON.stringify(deps) : null, now(), opts.linkId, opts.num);
 
+  // Explicitly resetting a task to 'todo' re-arms it for autopilot (a stuck/failed dispatch can be retried).
+  if (opts.status === 'todo') db.prepare('UPDATE tasks SET dispatched_at = NULL WHERE link_id = ? AND num = ?').run(opts.linkId, opts.num);
+
   const unblocked = status === 'done' ? autoUnblock(opts.linkId, opts.num) : [];
   return { task: getTask(opts.linkId, opts.num), unblocked };
+}
+
+// ---------------------------------------------------------------------------
+// Watches — "ping me (and wake my pane if possible) when X happens on this link".
+// Registration + matching live here; DELIVERY (post + tmux wake) lives in watch.ts.
+// ---------------------------------------------------------------------------
+export const WATCH_EVENTS = ['message', 'task_done', 'task_ready', 'answer', 'question', 'release'] as const;
+export type WatchEvent = (typeof WATCH_EVENTS)[number];
+
+const WATCH_COLS = 'id, label, event, arg, note, once, created_at, triggered_at, fire_count';
+
+export function addWatch(opts: { linkId: string; label: string; event: string; arg?: string; note?: string; once?: boolean }) {
+  if (!linkExists(opts.linkId)) throw new Error(`No link with id "${opts.linkId}".`);
+  if (!WATCH_EVENTS.includes(opts.event as WatchEvent)) throw new Error(`event must be one of: ${WATCH_EVENTS.join(', ')}`);
+  const arg = opts.arg?.trim() || null;
+  // Re-registering the same (label, event, arg) re-arms the existing row instead of stacking dupes.
+  const dupe = db
+    .prepare('SELECT id FROM watches WHERE link_id = ? AND label = ? AND event = ? AND COALESCE(arg, \'\') = COALESCE(?, \'\')')
+    .get(opts.linkId, opts.label, opts.event, arg) as any;
+  if (dupe) {
+    db.prepare('UPDATE watches SET triggered_at = NULL, once = ?, note = COALESCE(?, note) WHERE id = ?').run(opts.once === false ? 0 : 1, opts.note ?? null, dupe.id);
+    return db.prepare(`SELECT ${WATCH_COLS} FROM watches WHERE id = ?`).get(dupe.id) as any;
+  }
+  const info = db
+    .prepare('INSERT INTO watches (link_id, label, event, arg, note, once, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(opts.linkId, opts.label, opts.event, arg, opts.note ?? null, opts.once === false ? 0 : 1, now());
+  touchParticipant(opts.linkId, { label: opts.label });
+  return db.prepare(`SELECT ${WATCH_COLS} FROM watches WHERE id = ?`).get(Number(info.lastInsertRowid)) as any;
+}
+
+/** Active watches (one-shots that already fired are excluded). */
+export function listWatches(linkId: string, opts: { all?: boolean } = {}) {
+  const rows = db.prepare(`SELECT ${WATCH_COLS} FROM watches WHERE link_id = ? ORDER BY id`).all(linkId) as any[];
+  return opts.all ? rows : rows.filter((w) => !(w.once && w.triggered_at));
+}
+
+/** Remove watches: by id, or all held by a label. Returns how many were removed. */
+export function removeWatch(opts: { linkId: string; id?: number; label?: string }): number {
+  if (opts.id != null) return Number(db.prepare('DELETE FROM watches WHERE link_id = ? AND id = ?').run(opts.linkId, opts.id).changes);
+  if (opts.label) return Number(db.prepare('DELETE FROM watches WHERE link_id = ? AND label = ?').run(opts.linkId, opts.label).changes);
+  return 0;
+}
+
+/**
+ * Watches that should fire for an event. Never matches the actor's own watches (you don't get
+ * woken by your own action). For "release", arg matching is path-overlap aware like claims.
+ */
+export function matchWatches(linkId: string, event: WatchEvent, arg: string | undefined, from: string) {
+  return listWatches(linkId).filter((w) => {
+    if (w.event !== event) return false;
+    if (w.label === from) return false;
+    if (!w.arg) return true; // unscoped watch matches any arg
+    if (arg == null) return false;
+    if (event === 'release') return resourcesOverlap(w.arg, arg);
+    return String(w.arg) === String(arg);
+  });
+}
+
+export function markWatchFired(id: number) {
+  db.prepare('UPDATE watches SET triggered_at = ?, fire_count = fire_count + 1 WHERE id = ?').run(now(), id);
+}
+
+// ---------------------------------------------------------------------------
+// Autopilot config — per-link "self-executing task board" settings (JSON on links.autopilot).
+// The dispatch machinery itself lives in autopilot.ts.
+// ---------------------------------------------------------------------------
+export type AutopilotConfig = { on: boolean; agent?: 'claude' | 'codex'; cwd?: string; max?: number; headless?: boolean; by?: string };
+
+export function getAutopilot(linkId: string): AutopilotConfig | null {
+  const row = db.prepare('SELECT autopilot FROM links WHERE id = ?').get(linkId) as any;
+  if (!row?.autopilot) return null;
+  try {
+    const cfg = JSON.parse(row.autopilot);
+    return cfg && typeof cfg === 'object' ? cfg : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setAutopilot(linkId: string, cfg: AutopilotConfig | null) {
+  if (!linkExists(linkId)) throw new Error(`No link with id "${linkId}".`);
+  db.prepare('UPDATE links SET autopilot = ? WHERE id = ?').run(cfg ? JSON.stringify(cfg) : null, linkId);
+  return getAutopilot(linkId);
+}
+
+/** Tasks ready for dispatch: unblocked, not started, not already dispatched. */
+export function readyTasks(linkId: string) {
+  return db
+    .prepare(`SELECT ${TASK_COLS}, dispatched_at FROM tasks WHERE link_id = ? AND status = 'todo' AND dispatched_at IS NULL ORDER BY num`)
+    .all(linkId) as any[];
+}
+
+/** Dispatched-but-unfinished tasks — autopilot's in-flight set (bounds concurrency). */
+export function inflightTasks(linkId: string) {
+  return db
+    .prepare(`SELECT ${TASK_COLS}, dispatched_at FROM tasks WHERE link_id = ? AND dispatched_at IS NOT NULL AND status IN ('todo', 'doing') ORDER BY num`)
+    .all(linkId) as any[];
+}
+
+export function markDispatched(linkId: string, num: number, assignee?: string) {
+  db.prepare('UPDATE tasks SET dispatched_at = ?, assignee = COALESCE(?, assignee), updated_at = ? WHERE link_id = ? AND num = ?').run(
+    now(),
+    assignee ?? null,
+    now(),
+    linkId,
+    num
+  );
+  return getTask(linkId, num);
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +692,7 @@ export function deleteLink(linkId: string) {
   db.prepare('DELETE FROM participants WHERE link_id = ?').run(linkId);
   db.prepare('DELETE FROM claims WHERE link_id = ?').run(linkId);
   db.prepare('DELETE FROM tasks WHERE link_id = ?').run(linkId);
+  db.prepare('DELETE FROM watches WHERE link_id = ?').run(linkId);
   db.prepare('DELETE FROM git_state WHERE link_id = ?').run(linkId);
   const info = db.prepare('DELETE FROM links WHERE id = ?').run(linkId);
   // Release any parked long-poll waiters and prune their read-cursors, so repeated
