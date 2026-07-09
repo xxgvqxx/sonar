@@ -185,6 +185,7 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
   // A relay session (a remote teammate authenticated with a per-member token) may use the coordination
   // tools but NOT tools that read or run things on the hub host — its transcript index and its repos.
   const hostPrivateBlocked = () => !!opts.relay;
+  const isRelay = !!opts.relay;
 
   server.registerTool(
     'sonar_help',
@@ -585,7 +586,7 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
       if (gate.ran && !gate.allowed) return text(`🚫 task_created hook rejected this task:\n${gate.output || '(no output)'}`);
       let t: any;
       try {
-        t = core.createTask({ linkId: a.link_id, title: a.title, assignee: a.assignee, note: a.note, by: a.from, deps: a.depends_on });
+        t = core.createTask({ linkId: a.link_id, title: a.title, assignee: a.assignee, note: a.note, by: a.from, deps: a.depends_on, remote: isRelay });
       } catch (e) {
         return text((e as Error).message);
       }
@@ -597,13 +598,19 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
         dispatched = await autopilot.dispatchReady(a.link_id, { trigger: `task #${t.num} added` });
         syncTasks(a.link_id); // dispatch may have set assignees
       }
+      const mine = dispatched.find((d) => d.num === t.num);
+      const held = isRelay && t.status === 'todo' && core.getAutopilot(a.link_id)?.on;
       return text(
         `Added task #${t.num} "${t.title}" (${t.status}${t.assignee ? `, → ${t.assignee}` : ''}).\n` +
           (t.status === 'blocked'
             ? `It depends on ${a.depends_on?.map((n) => '#' + n).join(', ')} and will auto-unblock when those are done.`
-            : dispatched.some((d) => d.num === t.num)
-              ? `Autopilot dispatched it (${dispatched.find((d) => d.num === t.num)!.via}${dispatched.find((d) => d.num === t.num)!.assignee ? ` → ${dispatched.find((d) => d.num === t.num)!.assignee}` : ''}).`
-              : `Claim/progress it with task_update(link_id="${a.link_id}", num=${t.num}, from="${a.from}", status="doing", assignee="${a.from}"); finish with status="done".`) +
+            : mine
+              ? mine.error
+                ? `Autopilot tried to dispatch it but failed (${mine.error}) — it was re-armed for the next pass.`
+                : `Autopilot dispatched it (${mine.via}${mine.assignee ? ` → ${mine.assignee}` : ''}).`
+              : held
+                ? `Autopilot is ON but HOLDS remote-created tasks — a participant on the hub machine must review it (any task_update from a local session approves it for dispatch).`
+                : `Claim/progress it with task_update(link_id="${a.link_id}", num=${t.num}, from="${a.from}", status="doing", assignee="${a.from}"); finish with status="done".`) +
           pending(a.link_id, a.from)
       );
     }
@@ -641,7 +648,7 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
       }
       let r: { task: any; unblocked: number[] };
       try {
-        r = core.updateTask({ linkId: a.link_id, num: a.num, status: a.status, assignee: a.assignee, note: a.note, deps: a.depends_on });
+        r = core.updateTask({ linkId: a.link_id, num: a.num, status: a.status, assignee: a.assignee, note: a.note, deps: a.depends_on, localTouch: !isRelay });
       } catch (e) {
         return text((e as Error).message);
       }
@@ -795,8 +802,8 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
     },
     async (a) => {
       if (!core.linkExists(a.link_id)) return text(`No link "${a.link_id}".`);
-      const n = core.removeWatch({ linkId: a.link_id, id: a.id, label: a.id == null ? a.from : undefined });
-      return text(n ? `Removed ${n} watch(es).` : 'No matching watch.');
+      const n = core.removeWatch({ linkId: a.link_id, id: a.id, label: a.from });
+      return text(n ? `Removed ${n} watch(es).` : 'No matching watch (you can only remove your own).');
     }
   );
 
@@ -828,7 +835,7 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
         return text(
           `Autopilot on ${a.link_id}: ${cfg?.on ? `ON (agent ${cfg.agent || 'claude'}, max ${cfg.max ?? 2}${cfg.headless ? ', headless' : ''}${cfg.cwd ? `, cwd ${cfg.cwd}` : ''})` : 'off'}\n` +
             `In flight: ${inflight.length ? inflight.map((t) => `#${t.num} (${t.status}${t.assignee ? ` · ${t.assignee}` : ''})`).join(', ') : 'none'}\n` +
-            `Ready (undispatched): ${ready.length ? ready.map((t) => `#${t.num}`).join(', ') : 'none'}`
+            `Ready (undispatched): ${ready.length ? ready.map((t) => `#${t.num}${t.created_remote ? ' (held: remote-created — a local task_update approves it)' : ''}`).join(', ') : 'none'}`
         );
       }
       if (a.on && remoteExecBlocked()) {

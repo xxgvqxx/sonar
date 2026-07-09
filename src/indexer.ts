@@ -7,7 +7,7 @@ import { CLAUDE_PROJECTS, CODEX_SESSIONS, INDEX_DAYS, INDEX_POLL_MS, MAX_TEXT } 
 // git-root / repo detection, memoised per cwd
 // ---------------------------------------------------------------------------
 const repoCache = new Map<string, string | null>();
-function repoForCwd(cwd: string | undefined | null): string | null {
+export function repoForCwd(cwd: string | undefined | null): string | null {
   if (!cwd) return null;
   if (repoCache.has(cwd)) return repoCache.get(cwd)!;
   let dir = cwd;

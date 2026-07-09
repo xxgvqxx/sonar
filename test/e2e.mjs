@@ -12,7 +12,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const PORT = 7663;
+const PORT = 40000 + Math.floor(Math.random() * 20000); // avoid collisions with a real hub / parallel runs
 const BASE = `http://127.0.0.1:${PORT}`;
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'sonar-e2e-'));
 const FAKE_REPO = path.join(DIR, 'fakerepo');
@@ -159,12 +159,19 @@ console.log('\n[4] autopilot: concurrency cap + re-arm');
   await call('task_update', { link_id: LINK, num: 3, from: 'claude@task-3', status: 'done' });
   const st2 = await api('GET', `/api/links/${LINK}/autopilot`);
   ok(st2.inflight.some((t) => t.num === 4), 'finishing #3 pulled #4 into flight');
-  // re-arm: resetting to todo clears the dispatch reservation
-  await call('task_update', { link_id: LINK, num: 4, from: 'a@x', status: 'todo' });
-  const st3 = await api('GET', `/api/links/${LINK}/autopilot`);
-  ok(st3.ready.some((t) => t.num === 4) || st3.inflight.some((t) => t.num === 4), 'reset to todo re-arms the task');
+
+  // re-arm: with autopilot OFF, resetting to todo must clear the dispatch reservation AND the
+  // minted @task-4 assignee (else the retry would mis-route down the wake/ping path).
   const off = await call('autopilot', { link_id: LINK, from: 'a@x', on: false });
   ok(/OFF/i.test(off), 'autopilot disabled');
+  await call('task_update', { link_id: LINK, num: 4, from: 'a@x', status: 'todo' });
+  const st3 = await api('GET', `/api/links/${LINK}/autopilot`);
+  const t4 = st3.ready.find((t) => t.num === 4);
+  ok(!!t4, 'reset to todo re-arms the task');
+  ok(t4 && !t4.assignee, 'minted @task-4 assignee cleared on re-arm');
+  const on2 = await call('autopilot', { link_id: LINK, from: 'a@x', on: true, cwd: FAKE_REPO, max: 1 });
+  ok(/#4 \(dry-run/.test(on2), 're-armed #4 re-dispatches as a fresh worker', on2);
+  await call('autopilot', { link_id: LINK, from: 'a@x', on: false });
 }
 
 // ---- 5. brief -----------------------------------------------------------------
@@ -178,7 +185,7 @@ console.log('\n[5] brief');
   const l = viaRest.links.find((l) => l.id === LINK);
   ok(l && /deploy key/.test(l.open_questions || ''), 'open questions surfaced');
   ok(l && /Tuesday/.test(l.decisions || ''), 'decisions surfaced');
-  ok(l && l.open_tasks.some((t) => t.num === 4), 'open (re-armed) task surfaced');
+  ok(l && l.open_tasks.some((t) => t.num === 4), 'open task #4 surfaced');
   const viaMcp = await call('brief', { cwd: FAKE_REPO });
   ok(/^BRIEF/.test(viaMcp) && viaMcp.includes(LINK) && /deploy key/.test(viaMcp), 'MCP brief tool renders the same picture');
 }
@@ -193,6 +200,18 @@ console.log('\n[6] watches: answer event');
     msgs.some((m) => m.from_label === 'sonar' && m.body.includes('(answer)') && m.body.includes('a@x')),
     'watch(answer) fired when an Answer landed'
   );
+}
+
+// ---- 7. unwatch ownership -------------------------------------------------------
+console.log('\n[7] unwatch ownership');
+{
+  const armed = await call('watch', { link_id: LINK, from: 'a@x', event: 'message' });
+  const wid = Number((armed.match(/Watch #(\d+)/) || [])[1]);
+  ok(wid > 0, `watch #${wid} armed`);
+  const foreign = await call('unwatch', { link_id: LINK, from: 'b@y', id: wid });
+  ok(/No matching watch/.test(foreign), "another participant cannot remove someone else's watch by id");
+  const own = await call('unwatch', { link_id: LINK, from: 'a@x', id: wid });
+  ok(/Removed 1/.test(own), 'owner can remove their own watch');
 }
 
 await client.close();

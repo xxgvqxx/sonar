@@ -423,7 +423,7 @@ export function checkClaimConflicts(opts: { linkId: string; holder?: string; pat
 // ---------------------------------------------------------------------------
 export const TASK_STATUS = ['todo', 'doing', 'done', 'blocked'] as const;
 
-const TASK_COLS = 'num, title, status, assignee, note, deps, created_by, created_at, updated_at';
+const TASK_COLS = 'num, title, status, assignee, note, deps, created_by, created_at, updated_at, dispatched_at, created_remote';
 
 function parseDeps(raw: unknown): number[] {
   if (!raw || typeof raw !== 'string') return [];
@@ -479,7 +479,7 @@ export function listTasks(opts: { linkId: string; status?: string }) {
   return db.prepare(`SELECT ${TASK_COLS} FROM tasks WHERE link_id = ? ORDER BY num`).all(opts.linkId) as any[];
 }
 
-export function createTask(opts: { linkId: string; title: string; assignee?: string; note?: string; by?: string; deps?: number[] }) {
+export function createTask(opts: { linkId: string; title: string; assignee?: string; note?: string; by?: string; deps?: number[]; remote?: boolean }) {
   if (!linkExists(opts.linkId)) throw new Error(`No link with id "${opts.linkId}".`);
   if (!opts.title?.trim()) throw new Error('title is required');
   const deps = sanitizeDeps(opts.linkId, opts.deps);
@@ -489,10 +489,15 @@ export function createTask(opts: { linkId: string; title: string; assignee?: str
   // A task with unfinished deps starts 'blocked'; it auto-flips to 'todo' when they all complete.
   const status = deps.some((d) => getTask(opts.linkId, d)?.status !== 'done') ? 'blocked' : 'todo';
   db.prepare(
-    `INSERT INTO tasks (link_id, num, title, status, assignee, note, deps, created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(opts.linkId, num, opts.title.trim(), status, opts.assignee ?? null, opts.note ?? null, deps.length ? JSON.stringify(deps) : null, opts.by ?? null, ts, ts);
+    `INSERT INTO tasks (link_id, num, title, status, assignee, note, deps, created_by, created_at, updated_at, created_remote)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(opts.linkId, num, opts.title.trim(), status, opts.assignee ?? null, opts.note ?? null, deps.length ? JSON.stringify(deps) : null, opts.by ?? null, ts, ts, opts.remote ? 1 : 0);
   return getTask(opts.linkId, num);
+}
+
+/** Is this assignee autopilot's own reservation label for task `num` (not a human assignment)? */
+export function isMintedAssignee(assignee: string | null | undefined, num: number): boolean {
+  return assignee === `claude@task-${num}` || assignee === `codex@task-${num}`;
 }
 
 export function updateTask(opts: {
@@ -502,6 +507,8 @@ export function updateTask(opts: {
   assignee?: string;
   note?: string;
   deps?: number[];
+  /** True when the caller is a LOCAL (non-relay) session — their touch approves a remote-created task for autopilot. */
+  localTouch?: boolean;
 }): { task: any; unblocked: number[] } {
   const task = getTask(opts.linkId, opts.num);
   if (!task) throw new Error(`No task #${opts.num} on ${opts.linkId}.`);
@@ -527,8 +534,22 @@ export function updateTask(opts: {
      WHERE link_id = ? AND num = ?`
   ).run(status ?? null, opts.assignee ?? null, opts.note ?? null, deps.length ? JSON.stringify(deps) : null, now(), opts.linkId, opts.num);
 
-  // Explicitly resetting a task to 'todo' re-arms it for autopilot (a stuck/failed dispatch can be retried).
-  if (opts.status === 'todo') db.prepare('UPDATE tasks SET dispatched_at = NULL WHERE link_id = ? AND num = ?').run(opts.linkId, opts.num);
+  // Explicitly resetting a task to 'todo' re-arms it for autopilot (a stuck/failed dispatch can be
+  // retried). Also drop an autopilot-minted "<agent>@task-N" assignee — it was a dispatch
+  // reservation, not a human assignment; leaving it would send the retry down the wake/ping path
+  // (to a worker that no longer exists) instead of spawning a fresh one.
+  if (opts.status === 'todo') {
+    db.prepare('UPDATE tasks SET dispatched_at = NULL WHERE link_id = ? AND num = ?').run(opts.linkId, opts.num);
+    const cur = getTask(opts.linkId, opts.num);
+    if (isMintedAssignee(cur?.assignee, opts.num) && opts.assignee === undefined) {
+      db.prepare('UPDATE tasks SET assignee = NULL WHERE link_id = ? AND num = ?').run(opts.linkId, opts.num);
+    }
+  }
+
+  // A local participant touching a remote-created task approves it for autopilot dispatch.
+  if (opts.localTouch && task.created_remote) {
+    db.prepare('UPDATE tasks SET created_remote = 0 WHERE link_id = ? AND num = ?').run(opts.linkId, opts.num);
+  }
 
   const unblocked = status === 'done' ? autoUnblock(opts.linkId, opts.num) : [];
   return { task: getTask(opts.linkId, opts.num), unblocked };
@@ -568,9 +589,14 @@ export function listWatches(linkId: string, opts: { all?: boolean } = {}) {
   return opts.all ? rows : rows.filter((w) => !(w.once && w.triggered_at));
 }
 
-/** Remove watches: by id, or all held by a label. Returns how many were removed. */
+/** Remove watches: by id (label-scoped when a label is supplied — you remove your own), or all
+ *  held by a label. Returns how many were removed. */
 export function removeWatch(opts: { linkId: string; id?: number; label?: string }): number {
-  if (opts.id != null) return Number(db.prepare('DELETE FROM watches WHERE link_id = ? AND id = ?').run(opts.linkId, opts.id).changes);
+  if (opts.id != null) {
+    if (opts.label)
+      return Number(db.prepare('DELETE FROM watches WHERE link_id = ? AND id = ? AND label = ?').run(opts.linkId, opts.id, opts.label).changes);
+    return Number(db.prepare('DELETE FROM watches WHERE link_id = ? AND id = ?').run(opts.linkId, opts.id).changes);
+  }
   if (opts.label) return Number(db.prepare('DELETE FROM watches WHERE link_id = ? AND label = ?').run(opts.linkId, opts.label).changes);
   return 0;
 }
@@ -620,14 +646,14 @@ export function setAutopilot(linkId: string, cfg: AutopilotConfig | null) {
 /** Tasks ready for dispatch: unblocked, not started, not already dispatched. */
 export function readyTasks(linkId: string) {
   return db
-    .prepare(`SELECT ${TASK_COLS}, dispatched_at FROM tasks WHERE link_id = ? AND status = 'todo' AND dispatched_at IS NULL ORDER BY num`)
+    .prepare(`SELECT ${TASK_COLS} FROM tasks WHERE link_id = ? AND status = 'todo' AND dispatched_at IS NULL ORDER BY num`)
     .all(linkId) as any[];
 }
 
 /** Dispatched-but-unfinished tasks — autopilot's in-flight set (bounds concurrency). */
 export function inflightTasks(linkId: string) {
   return db
-    .prepare(`SELECT ${TASK_COLS}, dispatched_at FROM tasks WHERE link_id = ? AND dispatched_at IS NOT NULL AND status IN ('todo', 'doing') ORDER BY num`)
+    .prepare(`SELECT ${TASK_COLS} FROM tasks WHERE link_id = ? AND dispatched_at IS NOT NULL AND status IN ('todo', 'doing') ORDER BY num`)
     .all(linkId) as any[];
 }
 

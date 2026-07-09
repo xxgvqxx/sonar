@@ -3,6 +3,7 @@
 Notable changes, newest first. Entries under **[Unreleased]** are auto-appended from commit subjects by `.githooks/post-commit` (enable in a clone with `git config core.hooksPath .githooks`); edit them freely and roll them under a version heading at release time.
 
 ## [Unreleased]
+- **2026-07-09** — Fix review findings: dispatch race, stale re-arm assignee, and exposed-mode gating
 - **2026-07-09** — Add autopilot (self-executing task board), watches (event-driven wake), and brief (session-start catch-up)
 - **2026-06-05** — Teach the agent commands about coordination + remote teammates
 - **2026-06-05** — Make the tunnel a managed background service (start/status/stop)

@@ -3,28 +3,10 @@
 // and the live state of any active links whose participants are in that repo (open tasks,
 // held claims, open questions, decisions, autopilot). The point is continuity without the
 // human re-pasting context: "call brief() first" is injected into session-init.
-import fs from 'node:fs';
-import path from 'node:path';
 import { db } from './db.ts';
 import * as core from './core.ts';
 import * as docs from './docs.ts';
-
-/** Same repo naming as the indexer: basename of the enclosing git root (else of the cwd). */
-export function repoFromCwd(cwd?: string): string | undefined {
-  if (!cwd) return undefined;
-  let dir = cwd;
-  for (let i = 0; i < 30; i++) {
-    try {
-      if (fs.existsSync(path.join(dir, '.git'))) return path.basename(dir);
-    } catch {
-      /* keep walking */
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return path.basename(cwd);
-}
+import { repoForCwd } from './indexer.ts'; // same (memoised) repo naming as the index itself
 
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1).trimEnd() + '…' : s);
 
@@ -64,7 +46,7 @@ export type Brief = {
 };
 
 export function brief(opts: { repo?: string; cwd?: string; branch?: string; days?: number } = {}): Brief {
-  const repo = opts.repo || repoFromCwd(opts.cwd);
+  const repo = opts.repo || repoForCwd(opts.cwd) || undefined;
   const days = Math.min(Math.max(opts.days ?? 14, 1), 90);
 
   const sessions = repo ? core.recentSessions({ repo, branch: opts.branch, limit: 8 }) : core.recentSessions({ limit: 8 });
@@ -91,7 +73,7 @@ export function brief(opts: { repo?: string; cwd?: string; branch?: string; days
   const links: Brief['links'] = [];
   for (const l of core.listLinks({ activeDays: days })) {
     const parts = core.listParticipants(l.id);
-    const inRepo = !repo || parts.some((p) => p.repo === repo || (p.cwd && repoFromCwd(p.cwd) === repo));
+    const inRepo = !repo || parts.some((p) => p.repo === repo || (p.cwd && repoForCwd(p.cwd) === repo));
     if (!inRepo) continue;
     links.push({
       id: l.id,

@@ -58,8 +58,17 @@ export async function dispatchReady(linkId: string, opts: { trigger?: string } =
   const max = Math.min(Math.max(cfg.max ?? DEFAULT_MAX, 1), MAX_MAX);
   const out: Dispatch[] = [];
 
-  for (const t of core.readyTasks(linkId)) {
+  for (const snap of core.readyTasks(linkId)) {
     if (core.inflightTasks(linkId).length >= max) break; // re-count each round: dispatches below add to it
+
+    // Re-fetch: the awaits below yield the event loop, so a concurrent dispatch pass may have
+    // taken (or a peer may have claimed/blocked) a task after our snapshot — never double-dispatch.
+    const t = core.getTask(linkId, snap.num);
+    if (!t || t.status !== 'todo' || t.dispatched_at) continue;
+    // Tasks created by a RELAY (remote member-token) session are held: autopilot must not turn a
+    // coordination-only token into code exec on the hub host. A local participant approves one by
+    // touching it (any task_update from a local session clears the hold).
+    if (t.created_remote) continue;
 
     if (t.assignee) {
       // Assigned to a known participant — nudge them rather than spawning a duplicate brain.
@@ -109,7 +118,7 @@ export async function dispatchReady(linkId: string, opts: { trigger?: string } =
       appendLog(linkId, WATCH_LABEL, `autopilot spawned **${label}** for **#${t.num}** (${r.mode})${opts.trigger ? ` · trigger: ${opts.trigger}` : ''}`);
       out.push({ num: t.num, title: t.title, via, assignee: label });
     } catch (e) {
-      db_rearm(linkId, t.num);
+      rearm(linkId, t.num);
       const msg = (e as Error).message;
       core.postMessage({ linkId, from: WATCH_LABEL, body: `⚠️ autopilot: could not spawn a worker for task #${t.num}: ${msg}` });
       out.push({ num: t.num, title: t.title, via: 'worker', error: msg });
@@ -118,10 +127,11 @@ export async function dispatchReady(linkId: string, opts: { trigger?: string } =
   return out;
 }
 
-/** Clear a failed dispatch so the task is picked up again next pass. */
-function db_rearm(linkId: string, num: number) {
+/** Clear a failed dispatch so the task is picked up again next pass (status→todo drops the
+ *  dispatched_at reservation AND the minted @task-N assignee — see core.updateTask). */
+function rearm(linkId: string, num: number) {
   try {
-    core.updateTask({ linkId, num, status: 'todo' }); // status→todo clears dispatched_at (core.ts)
+    core.updateTask({ linkId, num, status: 'todo' });
   } catch {
     /* best effort */
   }

@@ -156,6 +156,8 @@ for (const stmt of [
   'ALTER TABLE tasks ADD COLUMN deps TEXT',
   // when autopilot (or a watch ping) has already dispatched a ready task, so it isn't re-dispatched
   'ALTER TABLE tasks ADD COLUMN dispatched_at TEXT',
+  // 1 = created by a relay (remote member-token) session — autopilot holds it until a local participant touches it
+  'ALTER TABLE tasks ADD COLUMN created_remote INTEGER',
   // per-link autopilot config as JSON ({"on":true,"agent":"claude","cwd":"…","max":2,"headless":true}) or NULL = off
   'ALTER TABLE links ADD COLUMN autopilot TEXT',
 ]) {

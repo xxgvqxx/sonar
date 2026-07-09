@@ -55,12 +55,23 @@ function suppliedToken(req: Request): string | undefined {
 }
 
 /**
- * Guard for endpoints that run code / kill / mutate the host. Loopback callers always pass.
- * Non-loopback callers are refused (403) unless SONAR_ALLOW_REMOTE_EXEC is truthy.
- * Returns false (and sends 403) when the caller must be blocked.
+ * Guard for endpoints that run code / kill / mutate the host. Returns false (and sends 403)
+ * when the caller must be blocked.
+ *  • SONAR_ALLOW_REMOTE_EXEC: operator explicitly opted in → anyone authenticated passes.
+ *  • EXPOSED (tunnel/LAN): loopback is meaningless — a tunnel delivers remote traffic FROM
+ *    loopback — so only the ADMIN credential passes; member tokens are coordination-only.
+ *  • Not exposed: loopback passes, anything else is refused.
  */
 function requireLocalExec(req: Request, res: Response): boolean {
-  if (isLoopbackAddr(req.socket.remoteAddress) || allowRemoteExec()) return true;
+  if (allowRemoteExec()) return true;
+  if (isExposed()) {
+    if (isAdminReq(req)) return true;
+    res.status(403).json({
+      error: 'exec endpoints require the ADMIN token while the hub is exposed (a tunnel makes remote traffic look local) — member tokens cannot spawn/kill/wake on the hub host. Set SONAR_ALLOW_REMOTE_EXEC=1 to override.',
+    });
+    return false;
+  }
+  if (isLoopbackAddr(req.socket.remoteAddress)) return true;
   res.status(403).json({ error: 'remote exec disabled: this endpoint runs code on the hub host. Set SONAR_ALLOW_REMOTE_EXEC=1 to permit.' });
   return false;
 }
@@ -257,6 +268,7 @@ export function startServer() {
   app.get(
     '/api/search',
     wrap((req, res) => {
+      if (!requireAdmin(req, res)) return; // host-private: searches the hub host's own transcripts
       res.json(
         core.searchContext({
           query: String(req.query.q || ''),
@@ -393,6 +405,7 @@ export function startServer() {
   app.get(
     '/api/brief',
     wrap((req, res) => {
+      if (!requireAdmin(req, res)) return; // host-private: reads the hub host's transcript index
       const b = brief({
         repo: req.query.repo as string | undefined,
         cwd: req.query.cwd as string | undefined,
