@@ -239,7 +239,7 @@ const SLASH_COMMAND = `---
 description: Link this session to other Claude Code / Codex sessions via sonar — collaborate through a shared doc, ask/answer across sessions, or dispatch a worker.
 ---
 
-You have the sonar MCP tools: sonar_help (capabilities directory — call it if unsure which tool fits), link_create, link_join, link_list, doc_read, doc_append, doc_set_section, claim, release, task_add, task_update, git_sync, post, wait, read, search_context, spawn_worker. sonar coordinates multiple Claude Code / Codex sessions through a per-link SHARED MARKDOWN DOC that is the source of truth (both agents and the human read and edit it). Pings via post/wait just say "the doc changed".
+You have the sonar MCP tools: sonar_help (capabilities directory — call it if unsure which tool fits), link_create, link_join, link_list, doc_read, doc_append, doc_set_section, claim, release, task_add, task_update, git_sync, post, wait, read, watch, unwatch, autopilot, brief, search_context, spawn_worker. sonar coordinates multiple Claude Code / Codex sessions through a per-link SHARED MARKDOWN DOC that is the source of truth (both agents and the human read and edit it). Pings via post/wait just say "the doc changed".
 
 User argument (may be empty): "$ARGUMENTS"
 
@@ -253,6 +253,8 @@ INTERPRET THE ARGUMENT:
 - "search <text>"  → call search_context (add branch/repo filters if the user named one) and summarize the hits.
 - "doc <code>"  → call doc_read and show the user the doc.
 - "list"  → call link_list.
+- "brief"  → run pwd, then call brief(cwd=<pwd>) and give the user a tight summary of where things stand (recent sessions, open questions, tasks). Offer to rejoin any active link it surfaces.
+- "autopilot <code> [on|off]"  → the user wants the task board on <code> to execute itself. Run pwd first; call autopilot(link_id, from=<label>, on=true, cwd=<pwd>) (ask about headless vs visible terminals if unclear). Report what was dispatched. "off" → autopilot(link_id, from, on=false).
 - "tunnel" / "remote"  → the user wants to collaborate with a teammate on ANOTHER machine/network. This is an OPERATOR action, not a tool you call: tell them to run  sonar tunnel  in a terminal (it starts a background tunnel and prints a connect command + a revocable per-member token; the teammate runs that, and  sonar tunnel stop  ends it). Then collaborate over the link as usual.
 
 COLLABORATE (after joining):
@@ -271,6 +273,8 @@ LISTEN LOOP — CRITICAL. Do NOT end your turn after one post/append:
 RULES:
 - ALWAYS surface to the user what the other agent said and what changed in the doc. Never go silent after posting.
 - Put substantive content in the DOC (doc_append), not just in chat pings.
+- Waiting for something SPECIFIC (a task to finish, an answer, a file to free up)? Prefer watch(link_id, from, event, arg?) over an endless wait() loop — tell the user a watch is armed, then end your turn; the hub pings the link (and can wake this session if it runs under tmux) when it fires.
+- A pipeline of tasks the user wants run without babysitting? task_add each step (depends_on to order them), then autopilot(on=true, cwd=<repo>) — the hub spawns/wakes per ready task and cascades as they finish. Quality gates still guard every "done".
 - Same repo as the other session? Use claim(resource, from) BEFORE editing a shared file (it returns a conflict instead of clobbering), the task board (task_add / task_update with status="doing"/"done", and depends_on to order work), and git_sync to share your branch / ahead-behind / changed files. All of these render into the doc.
 - If THIS session is on a REMOTE/shared hub (you connected with a member token via  sonar connect), you have coordination tools only — search_context, recent_sessions, and spawn_worker are host-local and will be refused; exchange everything through the shared doc.
 - Live back-and-forth requires the OTHER session to also be running /sonar <id> (or /sonar listen <id>) at the same time. If it is not, tell the user: your writes are saved and will be seen when it joins, but nobody replies until then — or suggest /sonar spawn <id> <task> to dispatch a worker that will respond.
@@ -304,9 +308,12 @@ Run  git branch --show-current  and  pwd  first. Use label "codex@<branch>", age
 - claim(link_id, resource, from) before editing a shared file — it returns a conflict (who holds it) instead of letting you clobber; release(...) when done.
 - task_add / task_update (status="doing"/"done", assignee, depends_on) — a shared board; finishing a task auto-unblocks its dependents.
 - git_sync(link_id, from, branch, ahead, behind, changed, files) — publish your tree and see the peers'. All of these surface in the doc (Claims / Tasks / Git).
+- watch(link_id, from, event, arg?) — waiting for something specific (task_done #N, task_ready, answer, question, release <path>, message)? Arm a watch and go idle instead of looping wait(); the hub pings the link (and wakes a tmux pane) when it fires. unwatch(...) cancels.
+- autopilot(link_id, from, on=true, cwd=<repo>) — the hub EXECUTES the board: each ready task is dispatched (worker spawned, or assignee woken), cascading through depends_on as tasks finish. on=false stops it.
 - sonar_help() — a capabilities directory (decision map + every tool) if you're unsure which to use.
 
 ## Dispatch / search (host-local)
+- brief(cwd=<pwd>) — call FIRST when starting work in a repo: recent sessions, last conversation tail, open questions/decisions/tasks/claims from active links.
 - spawn_worker(link_id, task) — launch a new Claude/Codex session in an isolated git worktree that joins the link and works the task, writing back into the doc.
 - search_context(query, optional repo/branch/agent) — full-text search across BOTH Claude Code and Codex history (branch filter is exact only for Claude logs; filter Codex by repo).
 
@@ -387,9 +394,12 @@ function installCodex(url: string, token?: string): string {
 // can spawn a worker / pull context from the start (not only after /sonar).
 const SESSION_INIT = `## sonar — multi-session coordination (available)
 A local **sonar** MCP server is running, letting you coordinate with other Claude Code / Codex sessions. When it helps, use it (call **sonar_help** for a full capabilities directory):
+- **brief(cwd?)** — starting substantive work in a repo? Call this FIRST: it returns recent sessions here, the tail of the last conversation, and open questions / decisions / tasks / claims from active links — catch up instead of asking the user to re-explain.
 - **spawn_worker(link_id, task)** — if a task has a separable part (investigate another area/repo, run a parallel subtask, reproduce something in isolation), call link_create then spawn_worker to launch a worker agent in an isolated git worktree that does it and reports back through the shared doc. (Guided flow: /sonar — Codex: the "sonar" skill.)
 - **search_context(query, repo?, branch?)** — pull relevant context from your OWN past sessions (Claude + Codex history) instead of asking the user to re-paste.
 - **Coordinating the same repo with another live session:** claim(resource) before editing a shared file (avoid clobbering), the task board (task_add / task_update, depends_on), and git_sync to share branch/diff state — all surface in the shared doc.
+- **watch(event, arg?)** — instead of polling wait() for something specific (a task finishing, an answer, a claim freeing), register a watch and go idle; the hub pings the link and wakes your tmux pane when it fires.
+- **autopilot(on=true, cwd=…)** — makes the hub EXECUTE the task board: ready tasks are dispatched automatically (worker per unassigned task, wake for assigned ones), cascading through depends_on. Script a pipeline as tasks, enable autopilot, let it run.
 - Each link has a shared doc at ~/.sonar/links/<id>/context.md that is the source of truth; collaborate via doc_append / doc_read, ping with post / wait.
 - **Across machines/networks:** the human can run \`sonar tunnel\` (operator action) to share this hub with a remote teammate over a revocable token; suggest it if they want to collaborate with someone not on this machine.
 Use this only when it genuinely helps — don't spawn workers for trivial tasks. If the sonar tools aren't listed, the hub may be down (run: sonar start).`;
@@ -547,6 +557,67 @@ async function cmdSearch(args: string[]) {
   for (const h of hits) {
     console.log(`${h.agent} · ${h.repo ?? '?'}${h.branch ? '/' + h.branch : ''} · ${h.role}\n  ${String(h.excerpt).replace(/\s+/g, ' ').trim()}\n`);
   }
+}
+
+async function cmdBrief(args: string[]) {
+  await ensureUp();
+  const repo = args[0];
+  const qs = new URLSearchParams();
+  if (repo) qs.set('repo', repo);
+  else qs.set('cwd', process.cwd());
+  const r = await api('GET', `/api/brief?${qs}`);
+  console.log(r.text);
+}
+
+async function cmdAutopilot(args: string[]) {
+  await ensureUp();
+  const id = args.shift();
+  if (!id) throw new Error('usage: sonar autopilot <id> [on|off|status] [--agent claude|codex] [--max N] [--headless]');
+  const sub = args.find((a) => !a.startsWith('--')) || 'status';
+  if (sub === 'status') {
+    const r = await api('GET', `/api/links/${id}/autopilot`);
+    const cfg = r.config;
+    console.log(`autopilot on ${id}: ${cfg?.on ? `ON (agent ${cfg.agent || 'claude'}, max ${cfg.max ?? 2}${cfg.headless ? ', headless' : ''}${cfg.cwd ? `, cwd ${cfg.cwd}` : ''})` : 'off'}`);
+    console.log(`  in flight: ${r.inflight.length ? r.inflight.map((t: any) => `#${t.num}(${t.status})`).join(' ') : 'none'}`);
+    console.log(`  ready:     ${r.ready.length ? r.ready.map((t: any) => `#${t.num}`).join(' ') : 'none'}`);
+    return;
+  }
+  if (sub === 'off') {
+    await api('POST', `/api/links/${id}/autopilot`, { on: false });
+    console.log(`autopilot OFF on ${id}.`);
+    return;
+  }
+  if (sub !== 'on') throw new Error(`unknown subcommand "${sub}" — use on | off | status`);
+  let agent: string | undefined, max: number | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--agent') agent = args[++i];
+    else if (args[i] === '--max') max = Number(args[++i]);
+  }
+  const headless = args.includes('--headless');
+  const r = await api('POST', `/api/links/${id}/autopilot`, { on: true, cwd: process.cwd(), agent, max, headless, by: `cli@${gitBranch() ?? 'local'}` });
+  console.log(`autopilot ON on ${id} (max ${r.config?.max ?? 2}, agent ${r.config?.agent || 'claude'}${r.config?.headless ? ', headless' : ''}).`);
+  if (r.dispatched?.length) {
+    for (const d of r.dispatched) console.log(`  dispatched #${d.num} "${d.title}" — ${d.error ? `FAILED: ${d.error}` : `${d.via}${d.assignee ? ` → ${d.assignee}` : ''}`}`);
+  } else {
+    console.log('  nothing ready yet — tasks dispatch as they are added/unblocked. Watch with: sonar watch ' + id);
+  }
+}
+
+async function cmdWatches(args: string[]) {
+  await ensureUp();
+  const id = args.shift();
+  if (!id) throw new Error('usage: sonar watches <id> [rm <watchId>]');
+  if (args[0] === 'rm') {
+    const wid = Number(args[1]);
+    if (!wid) throw new Error('usage: sonar watches <id> rm <watchId>');
+    const r = await api('DELETE', `/api/links/${id}/watches/${wid}`);
+    console.log(r.removed ? `removed watch #${wid}` : `no watch #${wid}`);
+    return;
+  }
+  const rows = await api('GET', `/api/links/${id}/watches`);
+  if (!rows.length) return console.log('no active watches.');
+  for (const w of rows)
+    console.log(`#${w.id} ${w.label} ← ${w.event}${w.arg ? `(${w.arg})` : ''}${w.once ? '' : ' · persistent'}${w.fire_count ? ` · fired ${w.fire_count}×` : ''}${w.note ? ` · ${w.note}` : ''}`);
 }
 
 async function cmdReindex() {
@@ -1059,6 +1130,10 @@ Terminal helpers (talk to the running hub):
   sonar post <id> <message…>
   sonar read <id> [since_seq]
   sonar watch <id>     live-tail a link
+  sonar brief [repo]   session-start catch-up: recent sessions + open questions/tasks/decisions for a repo
+  sonar autopilot <id> on|off|status [--agent claude|codex] [--max N] [--headless]
+                       self-executing task board: hub dispatches every ready task (worker or wake)
+  sonar watches <id> [rm <watchId>]    list / remove event subscriptions on a link
   sonar search <query>
   sonar doc <id> [--open]              print (or open) the shared context doc
   sonar spawn <id> [claude|codex] <task…> [--headless]   dispatch a worker session on a link
@@ -1121,6 +1196,12 @@ const run = async () => {
       return cmdAttach();
     case 'rm':
       return cmdRm(rest);
+    case 'brief':
+      return cmdBrief(rest);
+    case 'autopilot':
+      return cmdAutopilot(rest);
+    case 'watches':
+      return cmdWatches(rest);
     case 'reindex':
       return cmdReindex();
     case 'worktrees':

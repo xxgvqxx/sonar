@@ -14,7 +14,8 @@
     "start": "node --disable-warning=ExperimentalWarning src/cli.ts start",
     "stop": "node --disable-warning=ExperimentalWarning src/cli.ts stop",
     "status": "node --disable-warning=ExperimentalWarning src/cli.ts status",
-    "install:clients": "node --disable-warning=ExperimentalWarning src/cli.ts install"
+    "install:clients": "node --disable-warning=ExperimentalWarning src/cli.ts install",
+    "test:e2e": "node --disable-warning=ExperimentalWarning test/e2e.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
