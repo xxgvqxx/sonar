@@ -3,6 +3,7 @@
 Notable changes, newest first. Entries under **[Unreleased]** are auto-appended from commit subjects by `.githooks/post-commit` (enable in a clone with `git config core.hooksPath .githooks`); edit them freely and roll them under a version heading at release time.
 
 ## [Unreleased]
+- **2026-07-13** — Surface the real network error (and the fix) when the CLI cannot reach the hub
 - **2026-07-13** — Add nudge: a Stop hook that auto-resumes agents on link activity, no tmux needed
 - **2026-07-09** — Fix review findings: dispatch race, stale re-arm assignee, and exposed-mode gating
 - **2026-07-09** — Add autopilot (self-executing task board), watches (event-driven wake), and brief (session-start catch-up)

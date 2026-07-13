@@ -66,11 +66,28 @@ async function api(method: string, route: string, body?: any): Promise<any> {
   if (body) headers['content-type'] = 'application/json';
   const token = getToken();
   if (token) headers['authorization'] = `Bearer ${token}`;
-  const res = await fetch(`${BASE_URL}${route}`, {
-    method,
-    headers: Object.keys(headers).length ? headers : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BASE_URL}${route}`, {
+      method,
+      headers: Object.keys(headers).length ? headers : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    // Undici wraps every network failure as "TypeError: fetch failed" with the real error on
+    // .cause — surface it, plus what to DO about it, instead of the useless wrapper text.
+    const cause: any = (e as any)?.cause ?? e;
+    const code = String(cause?.code || '');
+    const where = cause?.address ? ` ${cause.address}:${cause.port ?? ''}` : '';
+    const detail = [code, cause?.syscall].filter(Boolean).join(' ') + where;
+    const hint =
+      code === 'EPERM'
+        ? 'a sandbox is denying local-network connects from THIS shell (agent Bash tools are often sandboxed) — sonar itself may be fine. Re-run outside the sandbox / with local network allowed, or use the sonar MCP tools instead of the CLI.'
+        : code === 'ECONNREFUSED'
+          ? 'nothing is listening on that port — start the hub with "sonar start" (or check "sonar status" and SONAR_PORT).'
+          : 'is the hub running? Check "sonar status".';
+    throw new Error(`cannot reach the sonar hub at ${BASE_URL}${route} (${detail || String(cause?.message || e)}) — ${hint}`);
+  }
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.json();
 }
