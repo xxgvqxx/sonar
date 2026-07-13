@@ -77,3 +77,36 @@ export async function fireWatches(opts: {
   }
   return fired.map(({ scope: _scope, ...f }) => f);
 }
+
+/**
+ * Implicit watch(message) for everyone: after new activity on a link, try to wake EVERY other
+ * participant with unread messages — no explicit watch() registration required, so two agents
+ * ping-pong on their own. Only reaches live sonar tmux panes (a no-op otherwise; non-tmux
+ * sessions are covered by the Stop-hook nudge instead). Idle-gate + loop-cap live in tmux.ts.
+ * Fire-and-forget: call it un-awaited so posting never pays the pane-probe latency.
+ */
+export async function autoWakePeers(opts: { linkId: string; from: string; detail: string }): Promise<void> {
+  if (opts.from === WATCH_LABEL) return;
+  try {
+    const peers = core.listParticipants(opts.linkId).filter((p) => p.label !== opts.from && p.label !== WATCH_LABEL);
+    await Promise.allSettled(
+      peers.map(async (p) => {
+        if (!core.unreadFor(opts.linkId, p.label).count) return;
+        const r = await wake({
+          linkId: opts.linkId,
+          label: p.label,
+          message: `New activity on sonar link ${opts.linkId}: ${opts.detail}. Call read(link_id="${opts.linkId}", from="${p.label}") and doc_read(link_id="${opts.linkId}") to catch up, handle anything addressed to you, then reply on the link.`,
+        });
+        if (r.ok) {
+          try {
+            appendLog(opts.linkId, WATCH_LABEL, `auto-woke **${p.label}** (new activity from ${opts.from})`);
+          } catch {
+            /* log is best-effort */
+          }
+        }
+      })
+    );
+  } catch {
+    /* wake delivery is a courtesy, never a failure */
+  }
+}

@@ -47,6 +47,7 @@ sonar install            # or: node src/cli.ts install
 - registers the MCP server with **Claude Code** (`claude mcp add --transport http --scope user sonar …`) and writes the `/sonar` slash command,
 - adds `[mcp_servers.sonar]` to **`~/.codex/config.toml`** and writes a Codex `sonar` skill,
 - appends a small **session‑init block** to `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` so every session knows, from startup, that it can spawn a worker / search context when useful (idempotent, bounded by `<!-- sonar:begin -->`…`<!-- sonar:end -->`),
+- installs the **nudge** — a Claude Code **Stop hook** (`~/.sonar/nudge.mjs`, registered in `~/.claude/settings.json`) that auto‑resumes a session when link activity is waiting for it, so agents converse without a human typing "check sonar" (see [Nudge](#nudge--agents-resume-on-their-own-no-tmux-required)),
 - starts the hub.
 
 > **Restart Claude Code / Codex afterwards** so they pick up the new MCP tools and instructions.
@@ -92,6 +93,27 @@ Why a doc instead of a chat? These agents are **turn‑based** — they only act
 - **Structured** — agents refine shared understanding (decisions, open questions) rather than scrolling a chat.
 
 For **instant** back‑and‑forth, both sessions must be active on the link at the same time (`/sonar <id>` on each). The `/sonar` command keeps each agent in a listen loop (`wait` → handle → report to you → repeat) and surfaces every update.
+
+### Nudge — agents resume on their own (no tmux required)
+
+Turn‑based agents used to be the bottleneck: A posts a question, B sits parked at its prompt until a human types "check sonar". The **nudge** closes that loop. `sonar install` registers a **Claude Code Stop hook** (`~/.sonar/nudge.mjs`) that runs every time a session tries to end its turn:
+
+- **Unread peer messages on an active link?** The stop is **blocked** and the agent is told exactly what to read (`read(link_id, from=…, since_seq=…)` + `doc_read`) — it handles the messages, replies in the doc, and only then parks.
+- **Did this session speak last (awaiting a reply)?** The hub **holds the stop open** (long‑poll, default 10 min) and releases it the instant the peer posts — so the reply is processed immediately, in any terminal (Ghostty, Terminal, iTerm — no tmux needed).
+
+Both sides doing this = autonomous ping‑pong: post → end turn → get resumed → answer → end turn → …, with the human just watching the shared doc. On top of that, every new message **auto‑wakes** any peer with a live sonar tmux pane (an implicit `watch(message)` for everyone — no registration needed).
+
+Guardrails: the hook **fails open** (hub down → stops proceed normally), only engages for links with ≥2 participants and activity in the last 45 min, and a **loop cap** (default 30 auto‑resumes per session per hour) means two agents can't ping‑pong forever. Catching up with `read(..., from=<your label>)` advances your unread cursor, so you're never re‑nudged about messages you've already read.
+
+```bash
+sonar nudge                # status: enabled? hook installed? hold window, loop cap
+sonar nudge on|off         # toggle without uninstalling
+sonar nudge hold <seconds> # how long a stop is held awaiting a reply (0 = report-only, max 900)
+sonar nudge cap <n>        # auto-resumes per session per hour
+sonar nudge install        # (re)write the hook + register it in ~/.claude/settings.json
+```
+
+Settings live under the `nudge` key in `~/.sonar/config.json` (`enabled`, `hold_ms`, `max_per_hour`, `active_min`). Codex has no hook system, so Codex sessions rely on the tmux auto‑wake or their own `wait()` loops.
 
 **Token‑efficient reads.** The doc never re‑pays for its whole history on every glance. `doc_read` returns a **compact view** by default — every section, but the append‑only **Log** trimmed to its most recent entries — and the on‑disk Log auto‑rotates: older entries spill to `context.archive.md` so `context.md` stays bounded. Read a single section with `doc_read(section="…")` (e.g. `section="Log"` for the full live Log), or the entire document with `doc_read(full=true)`. Doc‑change pings stay terse (they say *what* changed, not a copy of the prose) so the message stream doesn't duplicate the doc. For a frontend⇄backend pair, the efficient pattern is to keep the shared **contract** (API shape / types) in a section you `doc_set_section` (replace, bounded) and use `post`/`wait` for "I changed X" change events.
 
@@ -281,6 +303,8 @@ sonar doc <id> [--open]        print / open a link's shared context doc
 sonar brief [repo]             session-start catch-up: recent sessions + open questions/tasks/decisions
 sonar autopilot <id> on|off|status [--agent claude|codex] [--max N] [--headless]
                                self-executing task board — the hub dispatches every ready task
+sonar nudge [status|on|off|hold <sec>|cap <n>|install]
+                               the Stop hook that auto-resumes Claude sessions on link activity
 sonar watches <id> [rm <n>]    list / remove event subscriptions on a link
 sonar spawn <id> [claude|codex] <task…> [--headless]   dispatch a worker on a link
 sonar wake <id> <label> [message…] [--force]   type a prompt into a live tmux pane to make a paused agent run again
@@ -319,7 +343,7 @@ sonar bar [fg]                 launch the macOS menu-bar app
 | `watch` / `unwatch` | subscribe to an event (`message`, `task_done`/`task_ready` [arg=#], `answer`, `question`, `release` [arg=path]) — on fire the hub posts a targeted 📣 ping and wakes the subscriber's tmux pane when possible; one‑shot by default |
 | `autopilot` | per‑link self‑executing task board: every ready task is dispatched (assignee woken, or a dedicated worker spawned), cascading through `depends_on`, capped (default 2 in flight); call with `on` omitted for status |
 | `brief` | session‑start catch‑up for a repo: recent sessions, last conversation's tail, and each active link's open tasks / claims / questions / decisions |
-| `post` / `read` | send / read "doc changed" pings |
+| `post` / `read` | send / read "doc changed" pings; `read(from=…)` also advances your unread cursor so the nudge knows you caught up |
 | `wait` | long‑poll until the link changes (or timeout); per‑participant cursor so a loop blocks correctly |
 | `search_context` | FTS over indexed Claude + Codex history; filter by repo / branch / agent |
 | `recent_sessions` | list indexed sessions |
@@ -367,7 +391,7 @@ The other machine registers that URL with the token (the `invite` output gives t
 
 ## Limitations
 
-- **Turn‑based agents.** Instant back‑and‑forth needs both sessions live at once; otherwise the shared doc holds everything for whenever the other side is next active. Spawned workers are the autonomous path, and `sonar wake` (tmux) can re‑prompt a paused session in place — but only sessions launched under tmux are wake‑able; a bare Ghostty pane can't be injected into.
+- **Turn‑based agents.** The nudge (Stop hook) auto‑resumes Claude sessions in any terminal — at turn end they're re‑prompted about unread link activity, and a session awaiting a reply is held and released the moment it lands. What it can't do is re‑prompt a session that already parked *before* the message arrived and whose hold window ran out; that gap is covered by tmux auto‑wake (`sonar wake` / auto‑wake need the session under tmux — a bare Ghostty pane can't be injected into), by the next human prompt, or by the shared doc whenever the session is next active. Codex has no hook system, so Codex sessions rely on tmux auto‑wake or `wait()` loops.
 - **Codex branch tagging.** Codex transcripts record `cwd` but not the git branch — branch filtering in search is exact only for Claude sessions.
 - **Indexing window.** Only the last `SONAR_INDEX_DAYS` of transcripts are indexed; the first run backfills in the background.
 - **Loopback by default; opt‑in LAN.** Binds `127.0.0.1` with no auth out of the box. To share a hub across machines on a trusted network, set `SONAR_HOST=0.0.0.0` (which requires a token for remote callers — see [Running on a shared network](#running-on-a-shared-network-lan)). The token keeps strangers off the wifi out; it does not isolate trusted teammates from each other. Don't expose the hub on an untrusted network.

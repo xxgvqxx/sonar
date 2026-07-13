@@ -9,14 +9,14 @@ import { registerTools } from './tools.ts';
 import * as core from './core.ts';
 import * as sessions from './sessions.ts';
 import * as docs from './docs.ts';
-import { fireWatches } from './watch.ts';
+import { fireWatches, autoWakePeers } from './watch.ts';
 import * as autopilot from './autopilot.ts';
 import { brief, formatBrief } from './brief.ts';
 import { spawnWorker, listWorktrees, pruneWorktree, listWorkers, stopWorker } from './spawn.ts';
 import { listPanes, wake } from './tmux.ts';
 import { startIndexer, reindexAll } from './indexer.ts';
 import * as tokens from './tokens.ts';
-import { HOST, PORT, VERSION, PID_PATH, getToken, isLoopbackAddr, allowRemoteExec, isExposed, setExposed } from './config.ts';
+import { HOST, PORT, VERSION, PID_PATH, MAX_NUDGE_HOLD_MS, getToken, isLoopbackAddr, allowRemoteExec, isExposed, setExposed } from './config.ts';
 
 /** Parse a query param as a finite number, else undefined (so NaN never reaches core/SQL/setTimeout). */
 function numQ(v: unknown): number | undefined {
@@ -234,6 +234,7 @@ export function startServer() {
       const b = req.body || {};
       const r = core.postMessage({ linkId: req.params.id, from: b.from || 'anon', body: b.body || '', agent: b.agent, branch: b.branch, replyTo: b.reply_to });
       await fireWatches({ linkId: req.params.id, event: 'message', from: b.from || 'anon', detail: `message from ${b.from || 'anon'}: ${String(b.body || '').slice(0, 140)}` });
+      void autoWakePeers({ linkId: req.params.id, from: b.from || 'anon', detail: `message from ${b.from || 'anon'}: ${String(b.body || '').slice(0, 140)}` });
       res.json(r);
     })
   );
@@ -341,6 +342,7 @@ export function startServer() {
         await fireWatches({ linkId: req.params.id, event: 'answer', from: b.from, detail: `${b.from} answered: ${String(b.text || '').slice(0, 140)}` });
       if (b.from && sec === 'open questions')
         await fireWatches({ linkId: req.params.id, event: 'question', from: b.from, detail: `${b.from} asked: ${String(b.text || '').slice(0, 140)}` });
+      if (b.from) void autoWakePeers({ linkId: req.params.id, from: b.from, detail: `${b.from} appended to "${b.section || 'Log'}"` });
       res.json({ ok: true, path: docs.docPath(req.params.id) });
     })
   );
@@ -398,6 +400,50 @@ export function startServer() {
       if (!requireLocalExec(req, res)) return;
       if (!core.linkExists(req.params.id)) return res.status(404).json({ error: 'no such link' });
       res.json({ dispatched: await autopilot.dispatchReady(req.params.id, { trigger: 'manual dispatch' }) });
+    })
+  );
+
+  // ---- nudge (powers the Claude Code Stop hook: auto-resume without tmux) ----
+  // Given a session's identity (cwd + agent + branch), report unread messages across its active
+  // link participations. When hold_ms is set and the session is AWAITING A REPLY (it spoke last
+  // on a link), the request long-polls until the peer posts — so a Stop hook can keep the turn
+  // open and the agent resumes the instant the answer lands. Never advances read cursors.
+  app.post(
+    '/api/nudge',
+    wrap(async (req, res) => {
+      if (!requireAdmin(req, res)) return; // host-private: keyed on the hub host's own sessions
+      const b = req.body || {};
+      if (!b.cwd) return res.status(400).json({ error: 'cwd required' });
+      let pairs = core.nudgeCandidates({
+        cwd: String(b.cwd),
+        agent: b.agent ? String(b.agent) : undefined,
+        branch: b.branch ? String(b.branch) : undefined,
+        activeMin: numQ(b.active_min),
+      });
+      // Optional scope-down: the hook passes the link ids ITS transcript mentions, so a session
+      // that merely shares a cwd with a collaboration is never blocked/held on its behalf.
+      if (Array.isArray(b.links)) {
+        const allow = new Set(b.links.map(String));
+        pairs = pairs.filter((p) => allow.has(p.linkId));
+      }
+      const candidates = pairs.map((p) => ({ link_id: p.linkId, label: p.label }));
+      if (!pairs.length) return res.json({ attention: [], candidates, held: false });
+      let attention = core.nudgeAttention(pairs);
+      let held = false;
+      const holdMs = Math.min(Math.max(numQ(b.hold_ms) ?? 0, 0), MAX_NUDGE_HOLD_MS);
+      if (!attention.length && holdMs > 0 && pairs.some((p) => core.awaitingReply(p.linkId, p.label))) {
+        held = true;
+        const ac = new AbortController();
+        res.on('close', () => ac.abort());
+        const r = await core.holdForUnread({ pairs, timeoutMs: holdMs, signal: ac.signal });
+        if (r.aborted || res.headersSent) return; // client gone — nothing to send
+        attention = r.attention;
+      }
+      res.json({
+        held,
+        candidates,
+        attention: attention.map((a) => ({ link_id: a.link_id, label: a.label, unread: a.count, from: a.from, after: a.after, last_seq: a.lastSeq })),
+      });
     })
   );
 
