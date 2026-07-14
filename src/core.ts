@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { db } from './db.ts';
-import { DEFAULT_WAIT_MS, MAX_WAIT_MS } from './config.ts';
+import { DEFAULT_WAIT_MS, MAX_WAIT_MS, MAX_NUDGE_HOLD_MS } from './config.ts';
 
 const now = () => new Date().toISOString();
 
@@ -226,6 +226,129 @@ export function unreadFor(linkId: string, label: string): { count: number; lastS
   const from = [...new Set(rows.map((r) => r.from_label as string))];
   const lastSeq = rows.length ? Math.max(...rows.map((r) => r.seq as number)) : after;
   return { count: rows.length, lastSeq, after, from };
+}
+
+/**
+ * Advance a participant's read cursor to `seq` (never backwards). Lets a plain read(from=…)
+ * count as "caught up" — otherwise only wait() advances the cursor and the nudge hook would
+ * keep re-reporting messages the agent already read.
+ */
+export function advanceCursor(linkId: string, label: string, seq: number) {
+  const key = `${linkId}:${label}`;
+  cursors.set(key, Math.max(cursors.get(key) ?? 0, seq));
+}
+
+// ---------------------------------------------------------------------------
+// Nudge — powers the Claude Code Stop hook (`~/.sonar/nudge.mjs`): "does this
+// session have link activity it should handle before parking, and should the
+// hub hold its turn open until the peer replies?"
+// ---------------------------------------------------------------------------
+export type NudgePair = { linkId: string; label: string };
+
+/**
+ * Which (link, label) participations belong to a session identified by its cwd (+ agent/branch)?
+ * Only links with ≥2 real participants and a message inside the activity window count — a cold
+ * link must not make every future turn-end in that repo check/hold. When a branch is given and
+ * some candidates match it (participant.branch or an "@<branch>" label suffix), only those are
+ * returned — that disambiguates two same-agent sessions sharing a cwd.
+ */
+export function nudgeCandidates(opts: { cwd: string; agent?: string; branch?: string; activeMin?: number }): NudgePair[] {
+  const activeMin = Math.min(Math.max(opts.activeMin ?? 45, 1), 24 * 60);
+  const cutoff = new Date(Date.now() - activeMin * 60_000).toISOString();
+  const params: any[] = [opts.cwd];
+  let agentFilter = '';
+  if (opts.agent) {
+    agentFilter = 'AND (p.agent = ? OR (p.agent IS NULL AND p.label LIKE ?))';
+    params.push(opts.agent, `${opts.agent}@%`);
+  }
+  params.push(cutoff);
+  const rows = db
+    .prepare(
+      `SELECT p.link_id AS linkId, p.label, p.branch
+       FROM participants p
+       WHERE p.cwd = ? AND p.label != 'sonar' ${agentFilter}
+         AND EXISTS (SELECT 1 FROM messages m WHERE m.link_id = p.link_id AND m.created_at >= ?)
+         AND (SELECT COUNT(*) FROM participants q WHERE q.link_id = p.link_id AND q.label != 'sonar') >= 2`
+    )
+    .all(...params) as any[];
+  if (opts.branch) {
+    const b = opts.branch;
+    const matching = rows.filter((r) => r.branch === b || String(r.label).endsWith(`@${b}`));
+    if (matching.length) return matching.map((r) => ({ linkId: r.linkId, label: r.label }));
+  }
+  return rows.map((r) => ({ linkId: r.linkId, label: r.label }));
+}
+
+/** Is `label` the last (non-hub) voice on the link — i.e. it spoke and is awaiting a reply? */
+export function awaitingReply(linkId: string, label: string): boolean {
+  const row = db
+    .prepare(`SELECT from_label FROM messages WHERE link_id = ? AND from_label != 'sonar' ORDER BY seq DESC LIMIT 1`)
+    .get(linkId) as any;
+  return !!row && row.from_label === label;
+}
+
+/** Park until ANY of the given links gets a message not from that pair's own label (or timeout/abort). */
+function parkOnAny(pairs: NudgePair[], timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+  return new Promise((resolve) => {
+    const regs: { set: Set<Waiter>; w: Waiter }[] = [];
+    let done = false;
+    const settle = (fired: boolean) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      for (const { set, w } of regs) set.delete(w);
+      for (const p of pairs) {
+        const s = waiters.get(p.linkId);
+        if (s && s.size === 0) waiters.delete(p.linkId);
+      }
+      signal?.removeEventListener('abort', onAbort);
+      resolve(fired);
+    };
+    const timer = setTimeout(() => settle(false), timeoutMs);
+    const onAbort = () => settle(false);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    for (const p of pairs) {
+      const set = waiters.get(p.linkId) ?? new Set<Waiter>();
+      waiters.set(p.linkId, set);
+      const w: Waiter = { from: p.label, resolve: () => settle(true) };
+      set.add(w);
+      regs.push({ set, w });
+    }
+  });
+}
+
+export type NudgeAttention = { link_id: string; label: string; count: number; lastSeq: number; after: number; from: string[] };
+
+const attentionFor = (pairs: NudgePair[]): NudgeAttention[] =>
+  pairs.map((p) => ({ link_id: p.linkId, label: p.label, ...unreadFor(p.linkId, p.label) })).filter((a) => a.count > 0);
+
+/**
+ * Long-poll across a session's participations WITHOUT advancing any cursor: return as soon as
+ * any pair has unread messages, else hold until timeout/abort. This is what lets a Stop hook
+ * keep a turn open ("I asked a question — resume me the instant the reply lands").
+ */
+export async function holdForUnread(opts: {
+  pairs: NudgePair[];
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}): Promise<{ attention: NudgeAttention[]; timedOut: boolean; aborted?: boolean }> {
+  const deadline = Date.now() + Math.min(Math.max(opts.timeoutMs ?? 60_000, 1000), MAX_NUDGE_HOLD_MS);
+  // Loop because a wake isn't proof of unread (e.g. the message was our own from another pair) —
+  // recheck and re-park until something real lands or the clock runs out.
+  for (;;) {
+    if (opts.signal?.aborted) return { attention: [], timedOut: true, aborted: true };
+    const hits = attentionFor(opts.pairs);
+    if (hits.length) return { attention: hits, timedOut: false };
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { attention: [], timedOut: true };
+    const fired = await parkOnAny(opts.pairs, remaining, opts.signal);
+    if (!fired) return { attention: attentionFor(opts.pairs), timedOut: true, aborted: opts.signal?.aborted };
+  }
+}
+
+/** Immediate (non-blocking) unread check across pairs — the hold's fast path, shared with /api/nudge. */
+export function nudgeAttention(pairs: NudgePair[]): NudgeAttention[] {
+  return attentionFor(pairs);
 }
 
 // ---------------------------------------------------------------------------

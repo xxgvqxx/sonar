@@ -66,11 +66,30 @@ async function api(method: string, route: string, body?: any): Promise<any> {
   if (body) headers['content-type'] = 'application/json';
   const token = getToken();
   if (token) headers['authorization'] = `Bearer ${token}`;
-  const res = await fetch(`${BASE_URL}${route}`, {
-    method,
-    headers: Object.keys(headers).length ? headers : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BASE_URL}${route}`, {
+      method,
+      headers: Object.keys(headers).length ? headers : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    // Undici wraps every network failure as "TypeError: fetch failed" with the real error on
+    // .cause — surface it, plus what to DO about it, instead of the useless wrapper text.
+    const cause: any = (e as any)?.cause ?? e;
+    const code = String(cause?.code || '');
+    const where = cause?.address ? ` ${cause.address}:${cause.port ?? ''}` : '';
+    const detail = [code, cause?.syscall].filter(Boolean).join(' ') + where;
+    const hint =
+      code === 'EPERM'
+        ? 'a sandbox is denying local-network connects from THIS shell (agent Bash tools are often sandboxed) — sonar itself may be fine. Re-run outside the sandbox / with local network allowed, or use the sonar MCP tools instead of the CLI.'
+        : code === 'ECONNREFUSED'
+          ? 'nothing is listening on that port — start the hub with "sonar start" (or check "sonar status" and SONAR_PORT).'
+          : 'is the hub running? Check "sonar status".';
+    throw new Error(
+      `cannot reach the sonar hub at ${BASE_URL}${route} (${detail || String(cause?.message || e)}) — ${hint}\n(agent self-help runbook: ${AGENT_GUIDE_PATH})`
+    );
+  }
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.json();
 }
@@ -104,6 +123,7 @@ function lanIp(): string | undefined {
 async function cmdDaemon() {
   const { startServer } = await import('./server.ts');
   fs.mkdirSync(DATA_DIR, { recursive: true });
+  installAgentGuide(); // keep the self-help runbook present wherever the hub runs
   // Going LAN with no token? Generate a URL-safe one, persist it (merged with port), and hand it
   // to the live server via setToken so its auth middleware sees it. Log it so the operator can share.
   if (LAN_MODE) {
@@ -264,16 +284,18 @@ COLLABORATE (after joining):
 4. If you need something from the other agent, add it under "Open questions" and post() a ping.
 5. Run the LISTEN LOOP.
 
-LISTEN LOOP — CRITICAL. Do NOT end your turn after one post/append:
-- Call wait(link_id, from="claude@<branch>", timeout_ms=30000).
-- If messages arrive: tell the user VERBATIM what arrived, then doc_read to see the latest doc. Handle anything addressed to you (answer in the doc + post a ping), or ask the user how to respond.
-- If it times out empty: call wait AGAIN.
-- Keep looping for several rounds (about 8) so real back-and-forth can happen. Stop when the other side signals done, the task is resolved, or the user interrupts. On stop, summarize the doc and tell the user they can resume with  /sonar listen <id>.
+LISTEN LOOP — you do NOT need to poll. Sonar auto-resumes this session:
+- Sonar's nudge (a Stop hook) runs every time you end your turn: if peers posted new messages you are re-prompted with exactly what to read; and after YOU post a question, your stop is HELD so you resume the instant the reply lands. So the default rhythm is: post/append → tell the user what you did → END YOUR TURN.
+- When nudged awake: read(link_id, from="claude@<branch>", since_seq=<given>) + doc_read, tell the user VERBATIM what arrived, handle anything addressed to you (answer in the doc + post a ping), then end your turn again.
+- Only for a live, user-watching exchange call wait(link_id, from, timeout_ms=30000) — at most ~3 rounds — then fall back to ending your turn and letting the nudge drive.
+- Stop conditions: the other side posts done, the task is resolved, or the user interrupts. Then post "✅ done" (so the other side stops holding for a reply), summarize the doc, and tell the user they can resume with  /sonar listen <id>.
 
 RULES:
 - ALWAYS surface to the user what the other agent said and what changed in the doc. Never go silent after posting.
 - Put substantive content in the DOC (doc_append), not just in chat pings.
-- Waiting for something SPECIFIC (a task to finish, an answer, a file to free up)? Prefer watch(link_id, from, event, arg?) over an endless wait() loop — tell the user a watch is armed, then end your turn; the hub pings the link (and can wake this session if it runs under tmux) when it fires.
+- Catch up with read(..., from=<your label>) (not bare read) so sonar knows you've seen the messages and stops nudging you about them.
+- Something failing (CLI "fetch failed"/EPERM, silent peer, stale MCP session)? Read ~/.sonar/AGENTS.md — the agent self-help runbook — before retrying or telling the user sonar is broken. Sandboxed shells often block the CLI while the MCP tools still work.
+- Waiting for something SPECIFIC (a task to finish, an answer, a file to free up)? Prefer watch(link_id, from, event, arg?) — tell the user a watch is armed, then end your turn; the hub pings the link (and can wake this session if it runs under tmux) when it fires.
 - A pipeline of tasks the user wants run without babysitting? task_add each step (depends_on to order them), then autopilot(on=true, cwd=<repo>) — the hub spawns/wakes per ready task and cascades as they finish. Quality gates still guard every "done".
 - Same repo as the other session? Use claim(resource, from) BEFORE editing a shared file (it returns a conflict instead of clobbering), the task board (task_add / task_update with status="doing"/"done", and depends_on to order work), and git_sync to share your branch / ahead-behind / changed files. All of these render into the doc.
 - If THIS session is on a REMOTE/shared hub (you connected with a member token via  sonar connect), you have coordination tools only — search_context, recent_sessions, and spawn_worker are host-local and will be refused; exchange everything through the shared doc.
@@ -319,6 +341,9 @@ Run  git branch --show-current  and  pwd  first. Use label "codex@<branch>", age
 
 ## Remote teammates
 Live back-and-forth needs the other session active on the same link at the same time; otherwise writes are saved for when it joins, or use spawn_worker. To collaborate with a teammate on ANOTHER machine/network, the human runs  sonar tunnel  (operator action — prints a connect command + a revocable token). NOTE: if THIS session is connected to a remote/shared hub with a member token, you get coordination tools only — spawn_worker and search_context are host-local and will be refused; use the doc.
+
+## If sonar seems broken
+Read ~/.sonar/AGENTS.md — the agent self-help runbook (symptom → fix). Common: a sandboxed shell blocks the \`sonar\` CLI with "fetch failed"/EPERM while the MCP tools still work; a silent peer may simply be un-wakeable (message is saved for when it next runs).
 `;
 }
 
@@ -390,6 +415,301 @@ function installCodex(url: string, token?: string): string {
   return lines.join('\n');
 }
 
+// --------------------------------------------------------------------------
+// Agent self-help runbook — a PLAIN FILE agents can read to unstick themselves
+// precisely when the network path is broken (sandboxes block local connects
+// but allow file reads). Every failure surface points here: CLI errors, the
+// session-init block, /sonar, the Codex skill, and sonar_help.
+// --------------------------------------------------------------------------
+const AGENT_GUIDE_PATH = path.join(DATA_DIR, 'AGENTS.md');
+
+const AGENT_GUIDE = `# sonar — agent self-help (read this when sonar seems broken)
+
+You are an AI agent (Claude Code / Codex). A sonar call failed, a peer went silent, or nudges
+aren't firing. Find your symptom below and apply the fix. Everything here is safe to do without
+asking the human unless noted. Most "sonar is broken" reports are YOUR sandbox or a stale
+session — the hub is usually fine.
+
+## "TypeError: fetch failed" / "connect EPERM 127.0.0.1:<port>" from the \`sonar\` CLI or node fetch
+Your SHELL is sandboxed and the sandbox denies local-network connects. The hub is probably healthy.
+- FIX 1 (preferred): use the sonar MCP TOOLS (read, post, doc_read, doc_append, wait, task_*, …)
+  instead of the CLI. MCP calls run in your host process, not your sandboxed shell — not blocked.
+- FIX 2: re-run the command outside the sandbox (in Claude Code, run it with sandbox disabled —
+  the human may need to approve).
+- Do NOT retry the same command inside the sandbox; it will never work.
+
+## "ECONNREFUSED" — nothing listening on the port
+The hub is not running (or moved ports). Run \`sonar start\`. Port resolution: SONAR_PORT env →
+"port" in ~/.sonar/config.json → 7610. \`sonar status\` shows the live port.
+
+## The sonar MCP tools aren't listed at all
+Either the hub is down (\`sonar start\`), or your session started before \`sonar install\`
+registered the MCP server. Registration is picked up at session start — you cannot fix this
+yourself; tell the human to restart your session.
+
+## An MCP tool call fails with a session/transport error after working earlier
+The hub restarted and your MCP session went stale. Retry ONCE (clients re-initialize on the next
+call). Still failing → tell the human to restart your session.
+
+## You posted a question and no reply ever comes
+- The peer may be un-wakeable: Codex sessions have no Stop hook, and sessions not under tmux
+  cannot be injected. Your message IS saved — the peer sees it whenever it next runs.
+- Verify the peer is on the link (link_info) and check their last activity (doc_read).
+- Separable task? spawn_worker(link_id, task=…) launches a worker that WILL respond.
+- Never loop wait() endlessly: post → end your turn (the nudge resumes you when the reply lands),
+  or arm watch(event="message") and go idle.
+
+## You keep getting nudged about messages you already read
+Catch up with read(link_id, from="<YOUR label>") — from= is what advances your unread cursor;
+bare read() does not. wait() advances it too.
+
+## The nudge (Stop hook) never fires for you
+- It only exists in sessions started AFTER \`sonar install\` (hooks snapshot at session start).
+- It only engages for links YOUR transcript mentions, with ≥2 participants and activity in the
+  last 45 min. \`sonar nudge status\` shows enabled / hook / hold / cap.
+- Codex sessions never get nudges (no hook system) — use tmux auto-wake or wait() loops there.
+
+## Your turn end hangs for minutes on "Stop hook running"
+That is the nudge HOLD: you spoke last on an active link, so your stop is held awaiting the reply
+(default 10 min, capped 15). It releases the instant the peer posts. If the collaboration is
+actually over, post "✅ done" on the link first — then the hold never engages. Tune or disable:
+\`sonar nudge hold <seconds>\` / \`sonar nudge off\`.
+
+## When a collaboration finishes
+Post a final "✅ done" on the link so the other side's held stop releases immediately instead of
+waiting out its window.
+
+_(This file is (re)written by \`sonar install\` — do not hand-edit; it will be overwritten.)_
+`;
+
+/** Write the agent self-help runbook (idempotent; also refreshed at daemon boot so it always exists). */
+function installAgentGuide(): string {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(AGENT_GUIDE_PATH, AGENT_GUIDE);
+    return `  Agent self-help: ${AGENT_GUIDE_PATH} written (referenced by CLI errors + session-init)`;
+  } catch (e) {
+    return `  Agent self-help: FAILED writing ${AGENT_GUIDE_PATH} (${(e as Error).message})`;
+  }
+}
+
+// --------------------------------------------------------------------------
+// Nudge — a Claude Code Stop hook that makes agent↔agent conversation
+// self-driving in ANY terminal (no tmux needed). When a session tries to end
+// its turn, the hook asks the hub if its active links have unread peer
+// messages: yes → the stop is blocked so the agent handles them; and when the
+// agent spoke last (awaiting a reply) the hub HOLDS the request open and
+// returns the instant the peer posts — so the reply is processed immediately
+// instead of rotting until a human types "check sonar".
+// --------------------------------------------------------------------------
+const NUDGE_SCRIPT_PATH = path.join(DATA_DIR, 'nudge.mjs');
+const CLAUDE_SETTINGS = path.join(os.homedir(), '.claude', 'settings.json');
+
+const NUDGE_HOOK = `#!/usr/bin/env node
+// sonar nudge hook (managed by \`sonar install\`) — Claude Code Stop hook.
+// Asks the local sonar hub whether this session's active links have unread peer
+// messages. If yes, blocks the stop so the agent handles them; if the agent spoke
+// last (awaiting a reply) the hub holds this request open and answers the moment
+// the peer posts. Fails open on every error — a down hub never blocks a stop.
+// Config: the "nudge" object in ~/.sonar/config.json (sonar nudge on|off|hold|cap).
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execSync } from 'node:child_process';
+
+const DIR = process.env.SONAR_DIR || path.join(os.homedir(), '.sonar');
+const readJson = (f, fallback) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fallback; } };
+const cfg = readJson(path.join(DIR, 'config.json'), {});
+const n = cfg.nudge || {};
+if (n.enabled === false) process.exit(0);
+
+let hook = {};
+try { hook = JSON.parse(fs.readFileSync(0, 'utf8')); } catch { /* no stdin */ }
+const cwd = hook.cwd || process.cwd();
+const sid = String(hook.session_id || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'unknown';
+
+// Loop-cap: at most max_per_hour blocks per session per hour, so two agents can trade
+// that many turns unattended and then park instead of ping-ponging forever.
+const capFile = path.join(DIR, 'nudge', sid + '.json');
+const cap = Number(n.max_per_hour) > 0 ? Number(n.max_per_hour) : 30;
+const stamps = readJson(capFile, []).filter((t) => Date.now() - t < 3600000);
+if (stamps.length >= cap) process.exit(0);
+
+let branch = '';
+try { branch = execSync('git branch --show-current', { cwd, stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim(); } catch { /* not a repo */ }
+
+const port = Number(process.env.SONAR_PORT) || Number(cfg.port) || 7610;
+const holdMs = n.hold_ms != null ? Math.max(0, Number(n.hold_ms) || 0) : 600000; // default 10 min
+
+const postNudge = async (body, timeoutMs) => {
+  const ac = new AbortController();
+  const killer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const headers = { 'content-type': 'application/json' };
+    if (cfg.token) headers.authorization = 'Bearer ' + cfg.token;
+    const res = await fetch('http://127.0.0.1:' + port + '/api/nudge', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ cwd, agent: 'claude', branch: branch || undefined, active_min: n.active_min, ...body }),
+      signal: ac.signal,
+    });
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null; // hub down / aborted → treated as "nothing to do"
+  } finally {
+    clearTimeout(killer);
+  }
+};
+
+/** Tail of this session's transcript — used to scope nudges to links THIS session worked with. */
+const transcriptTail = (file, bytes) => {
+  try {
+    const size = fs.statSync(file).size;
+    const start = Math.max(0, size - bytes);
+    const buf = Buffer.alloc(size - start);
+    const fd = fs.openSync(file, 'r');
+    try { fs.readSync(fd, buf, 0, buf.length, start); } finally { fs.closeSync(fd); }
+    return buf.toString('utf8');
+  } catch {
+    return '';
+  }
+};
+
+// Phase 1: quick, non-holding check — which links could concern this cwd, and what's unread?
+const first = await postNudge({ hold_ms: 0 }, 10000);
+const candidates = first && Array.isArray(first.candidates) ? first.candidates : [];
+if (!candidates.length) process.exit(0);
+
+// Scope to links this SESSION actually participates in (its transcript mentions the id). A session
+// that merely shares the cwd with a collaboration must not be blocked — and above all not HELD —
+// on its behalf. No transcript → no proof of participation → stay out of the way.
+const tail = hook.transcript_path ? transcriptTail(hook.transcript_path, 512 * 1024) : '';
+if (!tail) process.exit(0);
+const mine = [...new Set(candidates.filter((c) => tail.includes(c.link_id)).map((c) => c.link_id))];
+if (!mine.length) process.exit(0);
+
+let att = (first.attention || []).filter((a) => mine.includes(a.link_id));
+if (!att.length && holdMs > 0) {
+  // Phase 2: nothing unread yet, but this session is a participant — hold the stop open so the
+  // peer's reply resumes it the moment it lands (the hub only holds if we spoke last).
+  const second = await postNudge({ hold_ms: holdMs, links: mine }, Math.min(holdMs, 900000) + 20000);
+  att = second && Array.isArray(second.attention) ? second.attention : [];
+}
+if (!att.length) process.exit(0);
+
+stamps.push(Date.now());
+try { fs.mkdirSync(path.dirname(capFile), { recursive: true }); fs.writeFileSync(capFile, JSON.stringify(stamps)); } catch { /* best effort */ }
+
+const lines = att.map((a) =>
+  '- link ' + a.link_id + ': ' + a.unread + ' unread for you ("' + a.label + '")' +
+  (a.from && a.from.length ? ' from ' + a.from.join(', ') : '') +
+  ' → read(link_id="' + a.link_id + '", since_seq=' + a.after + ', from="' + a.label + '") then doc_read(link_id="' + a.link_id + '")'
+);
+const reason =
+  '📡 sonar: new activity on your link(s) — handle it before stopping.\\n' + lines.join('\\n') +
+  '\\nHandle what is addressed to you (answer in the shared doc via doc_append + post() a ping), report to the user what happened, then end your turn — sonar wakes you again when the next message lands. ' +
+  'If the collaboration is finished, post a final "✅ done" so the other side stops waiting.';
+console.log(JSON.stringify({ decision: 'block', reason }));
+process.exit(0);
+`;
+
+/** Write ~/.sonar/nudge.mjs and register it as a Stop hook in ~/.claude/settings.json (idempotent). */
+function installNudgeHook(): string {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(NUDGE_SCRIPT_PATH, NUDGE_HOOK);
+  } catch (e) {
+    return `  Nudge hook: FAILED writing ${NUDGE_SCRIPT_PATH} (${(e as Error).message})`;
+  }
+  try {
+    let settings: any = {};
+    try {
+      settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS, 'utf8'));
+    } catch {
+      /* no settings yet */
+    }
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) settings = {};
+    if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
+    if (!Array.isArray(settings.hooks.Stop)) settings.hooks.Stop = [];
+    const command = `node "${NUDGE_SCRIPT_PATH}"`;
+    // timeout (seconds) must outlast the max server hold (900s) + the script's own abort margin
+    const hookDef = { type: 'command', command, timeout: 1200 };
+    const isOurs = (h: any) =>
+      typeof h?.command === 'string' && (h.command.includes(NUDGE_SCRIPT_PATH) || (h.command.includes('nudge.mjs') && h.command.includes('sonar')));
+    const existing = settings.hooks.Stop.find((g: any) => Array.isArray(g?.hooks) && g.hooks.some(isOurs));
+    if (existing) {
+      existing.hooks = existing.hooks.map((h: any) => (isOurs(h) ? hookDef : h));
+    } else {
+      settings.hooks.Stop.push({ hooks: [hookDef] });
+    }
+    fs.mkdirSync(path.dirname(CLAUDE_SETTINGS), { recursive: true });
+    fs.writeFileSync(CLAUDE_SETTINGS, JSON.stringify(settings, null, 2));
+    return `  Nudge: Stop hook installed (${NUDGE_SCRIPT_PATH} → ~/.claude/settings.json) — sessions auto-resume on link activity`;
+  } catch (e) {
+    return `  Nudge hook: script written, but registering in ${CLAUDE_SETTINGS} FAILED (${(e as Error).message})`;
+  }
+}
+
+function nudgeConfig(): { enabled: boolean; hold_ms: number; max_per_hour: number; active_min?: number } {
+  let cfg: any = {};
+  try {
+    cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch {
+    /* defaults */
+  }
+  const n = cfg.nudge || {};
+  return {
+    enabled: n.enabled !== false,
+    hold_ms: n.hold_ms != null ? Number(n.hold_ms) || 0 : 600_000,
+    max_per_hour: Number(n.max_per_hour) > 0 ? Number(n.max_per_hour) : 30,
+    active_min: n.active_min != null ? Number(n.active_min) : undefined,
+  };
+}
+
+function cmdNudge(args: string[]) {
+  const sub = args[0];
+  const n = nudgeConfig();
+  const save = (patch: Record<string, unknown>) => writeConfig({ nudge: { ...n, ...patch } });
+  if (sub === 'on' || sub === 'off') {
+    save({ enabled: sub === 'on' });
+    console.log(`nudge ${sub === 'on' ? 'ENABLED' : 'DISABLED'} (takes effect on each session's next turn end).`);
+    return;
+  }
+  if (sub === 'hold') {
+    const secs = Number(args[1]);
+    if (!Number.isFinite(secs) || secs < 0) throw new Error('usage: sonar nudge hold <seconds>   (0 disables the hold; max 900)');
+    save({ hold_ms: Math.min(secs, 900) * 1000 });
+    console.log(`nudge hold window set to ${Math.min(secs, 900)}s — after posting, a session's stop is held that long awaiting the reply.`);
+    return;
+  }
+  if (sub === 'cap') {
+    const perHour = Number(args[1]);
+    if (!Number.isInteger(perHour) || perHour < 1) throw new Error('usage: sonar nudge cap <blocks-per-hour>');
+    save({ max_per_hour: perHour });
+    console.log(`nudge loop-cap set to ${perHour} auto-resumes per session per hour.`);
+    return;
+  }
+  if (sub === 'install') {
+    console.log(installNudgeHook());
+    return;
+  }
+  if (sub && sub !== 'status') throw new Error('usage: sonar nudge [status | on | off | hold <seconds> | cap <per-hour> | install]');
+  const scriptOk = fs.existsSync(NUDGE_SCRIPT_PATH);
+  let registered = false;
+  try {
+    const s = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS, 'utf8'));
+    registered = (s.hooks?.Stop || []).some((g: any) => Array.isArray(g?.hooks) && g.hooks.some((h: any) => typeof h?.command === 'string' && h.command.includes('nudge.mjs')));
+  } catch {
+    /* unreadable settings = not registered */
+  }
+  console.log(`nudge (agents auto-resume on link activity — no "check sonar" needed):`);
+  console.log(`  enabled:     ${n.enabled ? 'yes' : 'NO (sonar nudge on)'}`);
+  console.log(`  hook:        ${scriptOk && registered ? `installed (${NUDGE_SCRIPT_PATH})` : 'NOT INSTALLED — run: sonar nudge install'}`);
+  console.log(`  hold window: ${Math.round(n.hold_ms / 1000)}s after speaking last (stop is held awaiting the reply)`);
+  console.log(`  loop cap:    ${n.max_per_hour} auto-resumes per session per hour`);
+  console.log(`  (Codex has no hook system — Codex sessions rely on tmux auto-wake or wait() loops.)`);
+}
+
 // Session-init awareness injected into every Claude/Codex session so it knows it
 // can spawn a worker / pull context from the start (not only after /sonar).
 const SESSION_INIT = `## sonar — multi-session coordination (available)
@@ -398,10 +718,12 @@ A local **sonar** MCP server is running, letting you coordinate with other Claud
 - **spawn_worker(link_id, task)** — if a task has a separable part (investigate another area/repo, run a parallel subtask, reproduce something in isolation), call link_create then spawn_worker to launch a worker agent in an isolated git worktree that does it and reports back through the shared doc. (Guided flow: /sonar — Codex: the "sonar" skill.)
 - **search_context(query, repo?, branch?)** — pull relevant context from your OWN past sessions (Claude + Codex history) instead of asking the user to re-paste.
 - **Coordinating the same repo with another live session:** claim(resource) before editing a shared file (avoid clobbering), the task board (task_add / task_update, depends_on), and git_sync to share branch/diff state — all surface in the shared doc.
-- **watch(event, arg?)** — instead of polling wait() for something specific (a task finishing, an answer, a claim freeing), register a watch and go idle; the hub pings the link and wakes your tmux pane when it fires.
+- **You never need to poll a link.** After you post()/doc_append() on a link, just END YOUR TURN: sonar's nudge (a Stop hook) checks for you — if peers posted, you'll be re-prompted with instructions; if you asked a question, your stop is held and you resume the instant the reply lands. When nudged: read(link_id, from=<your label>, since_seq=…) + doc_read, answer in the doc, post a ping, end your turn again. Post "✅ done" when a collaboration finishes so the other side stops waiting. Do NOT sit in long wait() loops.
+- **watch(event, arg?)** — for something specific (a task finishing, an answer, a claim freeing), register a watch and go idle; the hub pings the link and wakes your tmux pane when it fires.
 - **autopilot(on=true, cwd=…)** — makes the hub EXECUTE the task board: ready tasks are dispatched automatically (worker per unassigned task, wake for assigned ones), cascading through depends_on. Script a pipeline as tasks, enable autopilot, let it run.
 - Each link has a shared doc at ~/.sonar/links/<id>/context.md that is the source of truth; collaborate via doc_append / doc_read, ping with post / wait.
 - **Across machines/networks:** the human can run \`sonar tunnel\` (operator action) to share this hub with a remote teammate over a revocable token; suggest it if they want to collaborate with someone not on this machine.
+- **If sonar seems broken** (CLI "fetch failed"/EPERM, tools missing, nudges not firing, a peer never replies, your stop hangs on a hold): READ ~/.sonar/AGENTS.md — a self-help runbook with the fix per symptom. Most failures are your sandboxed shell or a stale session, not the hub; the MCP tools usually still work when the CLI cannot connect.
 Use this only when it genuinely helps — don't spawn workers for trivial tasks. If the sonar tools aren't listed, the hub may be down (run: sonar start).`;
 
 const CLAUDE_MD = path.join(os.homedir(), '.claude', 'CLAUDE.md');
@@ -468,6 +790,8 @@ async function cmdInstall() {
   console.log(installClaude(url, tok));
   console.log(installCodex(url, tok));
   console.log(installSessionInit());
+  console.log(installNudgeHook());
+  console.log(installAgentGuide());
   console.log('\nStarting the hub...');
   spawnDaemon(`http://${HOST}:${port}`);
   console.log('\nDone. Restart Claude Code / Codex so they pick up the new MCP server + session-init note.');
@@ -1134,6 +1458,9 @@ Terminal helpers (talk to the running hub):
   sonar autopilot <id> on|off|status [--agent claude|codex] [--max N] [--headless]
                        self-executing task board: hub dispatches every ready task (worker or wake)
   sonar watches <id> [rm <watchId>]    list / remove event subscriptions on a link
+  sonar nudge [status|on|off|hold <sec>|cap <n>|install]
+                                       the Stop hook that auto-resumes Claude sessions on link
+                                       activity — agents converse without a human typing "check sonar"
   sonar search <query>
   sonar doc <id> [--open]              print (or open) the shared context doc
   sonar spawn <id> [claude|codex] <task…> [--headless]   dispatch a worker session on a link
@@ -1202,6 +1529,8 @@ const run = async () => {
       return cmdAutopilot(rest);
     case 'watches':
       return cmdWatches(rest);
+    case 'nudge':
+      return cmdNudge(rest);
     case 'reindex':
       return cmdReindex();
     case 'worktrees':

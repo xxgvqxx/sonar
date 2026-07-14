@@ -115,3 +115,6 @@ export const MAX_TEXT = 8000;
 /** Default long-poll window for `wait` (kept under typical MCP client timeouts). */
 export const DEFAULT_WAIT_MS = 25_000;
 export const MAX_WAIT_MS = 110_000;
+
+/** Hard cap on how long /api/nudge may hold a Stop hook's turn open awaiting a peer reply. */
+export const MAX_NUDGE_HOLD_MS = 900_000;

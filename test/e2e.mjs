@@ -214,6 +214,68 @@ console.log('\n[7] unwatch ownership');
   ok(/Removed 1/.test(own), 'owner can remove their own watch');
 }
 
+// ---- 8. nudge: unread report, read(from) cursor advance, hold-until-reply -------
+console.log('\n[8] nudge (Stop-hook auto-resume)');
+{
+  const NUDGE_REPO = path.join(DIR, 'nudgerepo');
+  fs.mkdirSync(NUDGE_REPO, { recursive: true });
+  const made = await call('link_create', { label: 'claude@nud', agent: 'claude', cwd: NUDGE_REPO, title: 'nudge-e2e' });
+  const L2 = (made.match(/link:\s+(\w+)/) || [])[1];
+  ok(!!L2, `nudge link created (${L2})`);
+  await call('link_join', { link_id: L2, label: 'codex@nud', agent: 'codex', cwd: NUDGE_REPO });
+
+  // codex posts → the claude participant in that cwd has unread
+  await call('post', { link_id: L2, from: 'codex@nud', body: 'question for claude' });
+  const r1 = await api('POST', '/api/nudge', { cwd: NUDGE_REPO, agent: 'claude' });
+  ok(
+    r1.attention.length === 1 && r1.attention[0].label === 'claude@nud' && r1.attention[0].unread >= 1,
+    'nudge reports unread for the claude participant',
+    JSON.stringify(r1)
+  );
+  ok(r1.candidates.some((c) => c.link_id === L2 && c.label === 'claude@nud'), 'candidate participations listed');
+
+  // links filter scopes the check (how the hook excludes links this session never touched)
+  const rf = await api('POST', '/api/nudge', { cwd: NUDGE_REPO, agent: 'claude', links: ['zzzz'], hold_ms: 5000 });
+  ok(rf.attention.length === 0 && rf.candidates.length === 0 && rf.held === false, 'links filter excludes non-participating sessions (no block, no hold)');
+  const rf2 = await api('POST', '/api/nudge', { cwd: NUDGE_REPO, agent: 'claude', links: [L2] });
+  ok(rf2.attention.length === 1, 'links filter passes the participating link through');
+
+  // the poster's own agent has nothing unread (own messages excluded)
+  const r2 = await api('POST', '/api/nudge', { cwd: NUDGE_REPO, agent: 'codex' });
+  ok(r2.attention.length === 0, "poster's own nudge is quiet (own messages don't count)");
+
+  // read(from=…) advances the cursor → nudge goes quiet
+  await call('read', { link_id: L2, from: 'claude@nud' });
+  const r3 = await api('POST', '/api/nudge', { cwd: NUDGE_REPO, agent: 'claude' });
+  ok(r3.attention.length === 0, 'read(from=me) marks messages as seen — nudge goes quiet');
+
+  // claude replies (now awaiting a reply) → a held nudge resolves the moment codex posts
+  await call('post', { link_id: L2, from: 'claude@nud', body: 'answer for codex' });
+  const held = api('POST', '/api/nudge', { cwd: NUDGE_REPO, agent: 'claude', hold_ms: 8000 });
+  await sleep(600);
+  await call('post', { link_id: L2, from: 'codex@nud', body: 'follow-up from codex' });
+  const t0 = Date.now();
+  const r4 = await held;
+  ok(r4.held === true && r4.attention.length === 1 && r4.attention[0].unread >= 1, 'held nudge resolved by the peer reply', JSON.stringify(r4));
+  ok(Date.now() - t0 < 5000, 'hold resolved promptly (did not run out the window)');
+
+  // not awaiting a reply (peer spoke last) + nothing unread → returns immediately, no hold
+  await call('read', { link_id: L2, from: 'claude@nud' });
+  const t1 = Date.now();
+  const r5 = await api('POST', '/api/nudge', { cwd: NUDGE_REPO, agent: 'claude', hold_ms: 5000 });
+  ok(r5.held === false && r5.attention.length === 0 && Date.now() - t1 < 2000, 'no hold when the peer spoke last and nothing is unread');
+
+  // awaiting a reply that never comes → hold runs its window, then returns empty
+  await call('read', { link_id: L2, from: 'codex@nud' });
+  const t2 = Date.now();
+  const r6 = await api('POST', '/api/nudge', { cwd: NUDGE_REPO, agent: 'codex', hold_ms: 2000 });
+  ok(r6.held === true && r6.attention.length === 0 && Date.now() - t2 >= 1800, 'hold times out quietly when no reply lands');
+
+  // unknown cwd → no candidates, instant empty
+  const r7 = await api('POST', '/api/nudge', { cwd: path.join(DIR, 'nowhere'), agent: 'claude', hold_ms: 5000 });
+  ok(r7.attention.length === 0 && r7.held === false, 'cwd with no active links is instantly quiet');
+}
+
 await client.close();
 console.log(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);
 process.exit(failures === 0 ? 0 : 1);

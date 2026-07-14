@@ -4,10 +4,11 @@ import * as core from './core.ts';
 import * as docs from './docs.ts';
 import { spawnWorker } from './spawn.ts';
 import { runHook } from './hooks.ts';
-import { fireWatches } from './watch.ts';
+import { fireWatches, autoWakePeers } from './watch.ts';
 import * as autopilot from './autopilot.ts';
 import { brief, formatBrief } from './brief.ts';
-import { LAN_MODE, isLoopbackAddr, allowRemoteExec } from './config.ts';
+import path from 'node:path';
+import { LAN_MODE, isLoopbackAddr, allowRemoteExec, DATA_DIR } from './config.ts';
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
 
@@ -141,8 +142,8 @@ const ident = {
 // ---------------------------------------------------------------------------
 const DECISION_MAP: [need: string, use: string][] = [
   ['start collaborating with another session', 'link_create (share the ID) — or link_join if you were given a code'],
-  ['get an answer from another LIVE session', 'post() then wait() in a loop (re-read the doc on each ping)'],
-  ['catch up after a ping, or before you start working', 'doc_read (compact by default) — or read(since_seq=…) for just new messages'],
+  ['get an answer from another session', 'post() your question, then simply END YOUR TURN — sonar nudges/wakes you when the reply lands (wait() only if you want to stay on-line for an immediate back-and-forth)'],
+  ['catch up after a ping, or before you start working', 'doc_read (compact by default) — or read(since_seq=…, from=<your label>) for just new messages'],
   ['contribute context / ask a question / record an answer', 'doc_append(section="Context" | "Open questions" | "Answers")'],
   ['record a decision, or keep a bounded contract (API shape, types)', 'doc_set_section (replace = stays bounded, no append bloat)'],
   ['avoid clobbering a file the other session may also edit', 'claim(resource="path", from=…) BEFORE you edit it — release() when done'],
@@ -203,7 +204,9 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
           `DECISION MAP\n${map}\n\n` +
           `TOOLS\n${guide}\n\n` +
           `NOTES\n` +
-          `• Typical flow: link_create / link_join → doc_read → doc_append your context → post a ping → wait() in a loop, re-reading the doc on each ping. Put substantive content in the DOC, not just in pings.\n` +
+          `• Typical flow: link_create / link_join → doc_read → doc_append your context → post a ping → END YOUR TURN. You do NOT need to poll: sonar's nudge hook re-prompts you when new messages land (and its Stop-hold resumes you the instant a reply to your question arrives), and tmux panes are auto-woken on new activity. Put substantive content in the DOC, not just in pings.\n` +
+          `• When you catch up, pass from=<your label> to read() (or use wait()) so sonar knows you've seen the messages — otherwise it keeps nudging you about them.\n` +
+          `• When a collaboration is FINISHED, post a final "✅ done" so the other side stops holding for your reply.\n` +
           `• Coordination state lives in the doc too: claim/release → "Claims" section, task_add/task_update → "Tasks", git_sync → "Git". So a single doc_read shows who holds which files, the task board, and each side's git state. Before editing a shared file, claim() it; before picking up work, read the Tasks section.\n` +
           `• Tasks can depend on others: a task with unfinished deps is "blocked" and refuses doing/done until they complete; finishing a task auto-unblocks anything waiting only on it.\n` +
           `• Enforcement you may hit: marking a task "done" can trigger an operator quality-gate (e.g. a test run) — if it fails you'll get the output back, so fix and retry. And if the operator installed the claim guard, a "git commit" touching a file another participant has claimed is blocked until you coordinate or they release it.\n` +
@@ -212,7 +215,8 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
           `• Starting fresh in a repo? brief(cwd=…) first — it returns recent sessions, the last conversation's tail, and open questions/decisions/tasks from active links, so you don't re-ask the human.\n` +
           `• doc_read is compact by default (Log trimmed, older entries archived); pass section="Log" or full=true for more.\n` +
           `• Re-prompting a PAUSED agent in place is an operator action (shell: "sonar wake <link> <label> [prompt]"), not an MCP tool — it needs the session to be running under tmux.\n` +
-          `• If you connected to a SHARED/REMOTE hub with a member token (a teammate across the network), you have the coordination tools only — search_context, recent_sessions, and spawn_worker are host-private and disabled for you. Exchange context through the shared doc instead.`
+          `• If you connected to a SHARED/REMOTE hub with a member token (a teammate across the network), you have the coordination tools only — search_context, recent_sessions, and spawn_worker are host-private and disabled for you. Exchange context through the shared doc instead.\n` +
+          `• Something failing (the \`sonar\` CLI errors with "fetch failed"/EPERM in your shell, a peer never replies, nudges don't fire)? Read the agent self-help runbook at ${path.join(DATA_DIR, 'AGENTS.md')} — symptom → fix. Sandboxed shells often block the CLI while these MCP tools still work.`
       );
     }
   );
@@ -337,7 +341,11 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
     async (a) => {
       const r = core.postMessage({ linkId: a.link_id, from: a.from, body: a.body, agent: a.agent, branch: a.branch, replyTo: a.reply_to });
       await fireWatches({ linkId: a.link_id, event: 'message', from: a.from, detail: `message from ${a.from}: ${a.body.slice(0, 140)}` });
-      return text(`Posted to ${a.link_id} as seq ${r.seq}. Call wait(link_id="${a.link_id}", from="${a.from}", after_seq=${r.seq}) to await a reply.` + pending(a.link_id, a.from));
+      void autoWakePeers({ linkId: a.link_id, from: a.from, detail: `message from ${a.from}: ${a.body.slice(0, 140)}` });
+      return text(
+        `Posted to ${a.link_id} as seq ${r.seq}. The other side will be nudged/woken automatically — you can simply END YOUR TURN and sonar resumes you when a reply lands (or call wait(link_id="${a.link_id}", from="${a.from}", after_seq=${r.seq}) to hold on-line).` +
+          pending(a.link_id, a.from)
+      );
     }
   );
 
@@ -345,16 +353,19 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
     'read',
     {
       title: 'Read sonar messages',
-      description: 'Read messages on a link. Use since_seq to get only what is new since you last read.',
+      description:
+        'Read messages on a link. Use since_seq to get only what is new since you last read. Pass `from` (your label) so sonar records you as caught up — otherwise the nudge hook keeps re-reporting the same messages as unread.',
       inputSchema: {
         link_id: z.string(),
         since_seq: z.number().optional().describe('Return only messages with seq greater than this.'),
+        from: z.string().optional().describe('Your participant label — advances your unread cursor over what this call returns.'),
         limit: z.number().optional(),
       },
     },
     async (a) => {
       if (!core.linkExists(a.link_id)) return text(`No link with id "${a.link_id}".`);
       const msgs = core.readMessages({ linkId: a.link_id, sinceSeq: a.since_seq, limit: a.limit });
+      if (a.from && msgs.length) core.advanceCursor(a.link_id, a.from, Math.max(...msgs.map((m) => m.seq as number)));
       return text(renderMessages(msgs));
     }
   );
@@ -485,6 +496,7 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
       const sec = a.section.trim().toLowerCase();
       if (sec === 'answers') await fireWatches({ linkId: a.link_id, event: 'answer', from: a.from, detail: `${a.from} answered: ${a.text.slice(0, 140)}` });
       if (sec === 'open questions') await fireWatches({ linkId: a.link_id, event: 'question', from: a.from, detail: `${a.from} asked: ${a.text.slice(0, 140)}` });
+      void autoWakePeers({ linkId: a.link_id, from: a.from, detail: `${a.from} appended to "${a.section}": ${a.text.slice(0, 140)}` });
       return text(`Appended to "${a.section}" and pinged the link. Doc: ${docs.docPath(a.link_id)}` + pending(a.link_id, a.from));
     }
   );
