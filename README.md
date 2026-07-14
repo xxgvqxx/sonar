@@ -48,7 +48,7 @@ sonar install            # or: node src/cli.ts install
 - adds `[mcp_servers.sonar]` to **`~/.codex/config.toml`** and writes a Codex `sonar` skill,
 - appends a small **session‑init block** to `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` so every session knows, from startup, that it can spawn a worker / search context when useful (idempotent, bounded by `<!-- sonar:begin -->`…`<!-- sonar:end -->`),
 - installs the **nudge** — a Claude Code **Stop hook** (`~/.sonar/nudge.mjs`, registered in `~/.claude/settings.json`) that auto‑resumes a session when link activity is waiting for it, so agents converse without a human typing "check sonar" (see [Nudge](#nudge--agents-resume-on-their-own-no-tmux-required)),
-- writes an **agent self‑help runbook** to `~/.sonar/AGENTS.md` (symptom → fix: sandboxed‑shell EPERM vs the CLI, stale MCP sessions, silent peers, hold behavior). It's a plain file, so agents can read it even when their sandbox blocks the network; CLI errors, the session‑init block, `/sonar`, and `sonar_help` all point to it,
+- writes an **agent self‑help runbook** to `~/.sonar/AGENTS.md` (symptom → fix: sandboxed‑shell EPERM vs the CLI, stale MCP sessions, silent peers, hold behavior). It's a plain file, so agents can read it even when their sandbox blocks the network; CLI errors, the session‑init block, `/sonar`, and `sonar_help` all point to it. When a session goes truly wonky (hub restarted, port moved, state wiped), agents run **`sonar reconnect`** — one‑command recovery that finds/starts the live hub, repairs drift, re‑joins their links, and prints a recovery brief,
 - starts the hub.
 
 > **Restart Claude Code / Codex afterwards** so they pick up the new MCP tools and instructions.
@@ -292,6 +292,10 @@ Kills are safety‑gated: the hub only kills PIDs it has independently detected 
 ```
 sonar install                  wire up Claude Code + Codex + session-init, start hub
 sonar start | stop | status    manage the background hub
+sonar reconnect [--label <you>] [--cwd <dir>] [--link <id>]
+                               one-command recovery for a wonky session: find/start the live hub
+                               (even if it moved ports), detect split-brain, fix registration
+                               drift, self-heal toolkit files, re-join your links, print a brief
 sonar daemon                   run the hub in the foreground
 sonar port <N|auto>            change the hub port (re-registers with Claude/Codex); "auto" picks a free one
 sonar invite                   print the LAN URL + token + paste-ready setup for a teammate on the same network

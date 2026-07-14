@@ -276,6 +276,22 @@ console.log('\n[8] nudge (Stop-hook auto-resume)');
   ok(r7.attention.length === 0 && r7.held === false, 'cwd with no active links is instantly quiet');
 }
 
+// ---- 9. reconnect: one-command session recovery ---------------------------------
+console.log('\n[9] reconnect (one-command recovery)');
+{
+  const { execFileSync } = await import('node:child_process');
+  const out = execFileSync(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', path.join(ROOT, 'src', 'cli.ts'), 'reconnect', '--cwd', FAKE_REPO, '--label', 'a@x'],
+    { env: { ...process.env, HOME: DIR, SONAR_DIR: path.join(DIR, '.sonar'), SONAR_PORT: String(PORT) }, encoding: 'utf8' }
+  );
+  ok(out.includes(`live hub on :${PORT}`), 'found the live hub on the configured port');
+  ok(new RegExp(`re-joined: .*${LINK}`).test(out), 're-joined the cwd-matched link', out.slice(0, 400));
+  ok(/Stop hook installed/.test(out) && /Agent self-help/.test(out), 'self-healed the toolkit files');
+  ok(/BRIEF/i.test(out), 'printed a recovery brief');
+  ok(/Reconnected/.test(out), 'printed post-recovery guidance');
+}
+
 await client.close();
 console.log(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);
 process.exit(failures === 0 ? 0 : 1);

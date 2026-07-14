@@ -5,7 +5,7 @@ import net from 'node:net';
 import { spawn, execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { BASE_URL, MCP_URL, PID_PATH, LOG_PATH, DATA_DIR, PORT, HOST, VERSION, CONFIG_FILE, urlFor, LAN_MODE, getToken, setToken } from './config.ts';
+import { BASE_URL, MCP_URL, PID_PATH, LOG_PATH, DATA_DIR, PORT, HOST, VERSION, CONFIG_FILE, DEFAULT_PORT, urlFor, LAN_MODE, getToken, setToken } from './config.ts';
 
 const SELF = fileURLToPath(import.meta.url);
 
@@ -124,6 +124,11 @@ async function cmdDaemon() {
   const { startServer } = await import('./server.ts');
   fs.mkdirSync(DATA_DIR, { recursive: true });
   installAgentGuide(); // keep the self-help runbook present wherever the hub runs
+  try {
+    writeNudgeScript(); // self-heal a wiped ~/.sonar — the registered Stop hook needs this file
+  } catch {
+    /* the hook command tolerates a missing file; never block hub boot on this */
+  }
   // Going LAN with no token? Generate a URL-safe one, persist it (merged with port), and hand it
   // to the live server via setToken so its auth middleware sees it. Log it so the operator can share.
   if (LAN_MODE) {
@@ -294,7 +299,7 @@ RULES:
 - ALWAYS surface to the user what the other agent said and what changed in the doc. Never go silent after posting.
 - Put substantive content in the DOC (doc_append), not just in chat pings.
 - Catch up with read(..., from=<your label>) (not bare read) so sonar knows you've seen the messages and stops nudging you about them.
-- Something failing (CLI "fetch failed"/EPERM, silent peer, stale MCP session)? Read ~/.sonar/AGENTS.md — the agent self-help runbook — before retrying or telling the user sonar is broken. Sandboxed shells often block the CLI while the MCP tools still work.
+- Something failing (CLI "fetch failed"/EPERM, silent peer, stale MCP session)? Run  sonar reconnect  (one-command recovery: finds the live hub, fixes drift, re-joins your links) and read ~/.sonar/AGENTS.md — the agent self-help runbook — before retrying or telling the user sonar is broken. Sandboxed shells often block the CLI while the MCP tools still work.
 - Waiting for something SPECIFIC (a task to finish, an answer, a file to free up)? Prefer watch(link_id, from, event, arg?) — tell the user a watch is armed, then end your turn; the hub pings the link (and can wake this session if it runs under tmux) when it fires.
 - A pipeline of tasks the user wants run without babysitting? task_add each step (depends_on to order them), then autopilot(on=true, cwd=<repo>) — the hub spawns/wakes per ready task and cascades as they finish. Quality gates still guard every "done".
 - Same repo as the other session? Use claim(resource, from) BEFORE editing a shared file (it returns a conflict instead of clobbering), the task board (task_add / task_update with status="doing"/"done", and depends_on to order work), and git_sync to share your branch / ahead-behind / changed files. All of these render into the doc.
@@ -343,7 +348,7 @@ Run  git branch --show-current  and  pwd  first. Use label "codex@<branch>", age
 Live back-and-forth needs the other session active on the same link at the same time; otherwise writes are saved for when it joins, or use spawn_worker. To collaborate with a teammate on ANOTHER machine/network, the human runs  sonar tunnel  (operator action — prints a connect command + a revocable token). NOTE: if THIS session is connected to a remote/shared hub with a member token, you get coordination tools only — spawn_worker and search_context are host-local and will be refused; use the doc.
 
 ## If sonar seems broken
-Read ~/.sonar/AGENTS.md — the agent self-help runbook (symptom → fix). Common: a sandboxed shell blocks the \`sonar\` CLI with "fetch failed"/EPERM while the MCP tools still work; a silent peer may simply be un-wakeable (message is saved for when it next runs).
+Run  sonar reconnect  first — one-command recovery (finds/starts the live hub even if it moved ports, fixes registration drift, re-joins your links, prints unread + a brief). Then read ~/.sonar/AGENTS.md — the agent self-help runbook (symptom → fix). Common: a sandboxed shell blocks the \`sonar\` CLI with "fetch failed"/EPERM while the MCP tools still work; a silent peer may simply be un-wakeable (message is saved for when it next runs).
 `;
 }
 
@@ -430,6 +435,18 @@ aren't firing. Find your symptom below and apply the fix. Everything here is saf
 asking the human unless noted. Most "sonar is broken" reports are YOUR sandbox or a stale
 session — the hub is usually fine.
 
+## First move when anything is wonky: \`sonar reconnect\`
+One command, run from your repo, that recovers a broken session end-to-end: finds the live hub
+(even if it moved ports), detects split-brain (two hubs), repairs port/MCP registration drift,
+rewrites missing toolkit files, re-joins the links your cwd participates in, and prints your
+unread + a recovery brief.
+
+    sonar reconnect [--label <your label>] [--cwd <repo>] [--link <id>]
+
+If it fails with EPERM your shell is sandboxed — see the sandbox section below. If your MCP
+tools stay dead afterwards (the port changed), keep working through the CLI (sonar post/read/doc)
+until the human restarts your session.
+
 ## "TypeError: fetch failed" / "connect EPERM 127.0.0.1:<port>" from the \`sonar\` CLI or node fetch
 Your SHELL is sandboxed and the sandbox denies local-network connects. The hub is probably healthy.
 - FIX 1 (preferred): use the sonar MCP TOOLS (read, post, doc_read, doc_append, wait, task_*, …)
@@ -468,6 +485,12 @@ bare read() does not. wait() advances it too.
 - It only engages for links YOUR transcript mentions, with ≥2 participants and activity in the
   last 45 min. \`sonar nudge status\` shows enabled / hook / hold / cap.
 - Codex sessions never get nudges (no hook system) — use tmux auto-wake or wait() loops there.
+
+## Stop hook error: "Cannot find module …/.sonar/nudge.mjs"
+Something removed ~/.sonar (an uninstall, or a "reset" that went too wide — note the hub's own
+state DB lives there too). Fix: run \`sonar install\` (or just \`sonar nudge install\`) to rewrite
+the hook; starting the hub also rewrites it automatically. NEVER delete ~/.sonar to "fix" sonar —
+you lose every link, message, and task board on the machine.
 
 ## Your turn end hangs for minutes on "Stop hook running"
 That is the nudge HOLD: you spoke last on an active link, so your stop is held awaiting the reply
@@ -613,11 +636,16 @@ console.log(JSON.stringify({ decision: 'block', reason }));
 process.exit(0);
 `;
 
+/** Write ~/.sonar/nudge.mjs (also called at every daemon boot, so a wiped ~/.sonar self-heals). */
+function writeNudgeScript(): void {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(NUDGE_SCRIPT_PATH, NUDGE_HOOK);
+}
+
 /** Write ~/.sonar/nudge.mjs and register it as a Stop hook in ~/.claude/settings.json (idempotent). */
 function installNudgeHook(): string {
   try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(NUDGE_SCRIPT_PATH, NUDGE_HOOK);
+    writeNudgeScript();
   } catch (e) {
     return `  Nudge hook: FAILED writing ${NUDGE_SCRIPT_PATH} (${(e as Error).message})`;
   }
@@ -631,7 +659,9 @@ function installNudgeHook(): string {
     if (!settings || typeof settings !== 'object' || Array.isArray(settings)) settings = {};
     if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
     if (!Array.isArray(settings.hooks.Stop)) settings.hooks.Stop = [];
-    const command = `node "${NUDGE_SCRIPT_PATH}"`;
+    // Guard the invocation: if something removes ~/.sonar (uninstall, a "reset" gone wide), the
+    // hook is a silent no-op instead of a red MODULE_NOT_FOUND banner in every session's turn end.
+    const command = `[ -f "${NUDGE_SCRIPT_PATH}" ] && node "${NUDGE_SCRIPT_PATH}" || true`;
     // timeout (seconds) must outlast the max server hold (900s) + the script's own abort margin
     const hookDef = { type: 'command', command, timeout: 1200 };
     const isOurs = (h: any) =>
@@ -710,6 +740,131 @@ function cmdNudge(args: string[]) {
   console.log(`  (Codex has no hook system — Codex sessions rely on tmux auto-wake or wait() loops.)`);
 }
 
+// --------------------------------------------------------------------------
+// reconnect — one-command recovery for a WONKY SESSION, built to be run by an
+// agent from its own shell: find (or start) the live hub even if it moved
+// ports, detect split-brain (multiple hubs), repair port/MCP registration
+// drift, self-heal the toolkit files, re-join the links this session's cwd
+// participates in, and print unread + a recovery brief.
+// --------------------------------------------------------------------------
+async function probeHub(port: number, timeoutMs = 400): Promise<any | null> {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!r.ok) return null;
+    const j: any = await r.json();
+    return j && j.ok ? j : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cmdReconnect(args: string[]) {
+  let label: string | undefined, linkArg: string | undefined, cwd = process.cwd();
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--label') label = args[++i];
+    else if (args[i] === '--cwd') cwd = path.resolve(args[++i]);
+    else if (args[i] === '--link') linkArg = args[++i];
+  }
+  console.log('sonar reconnect — locate the live hub, repair drift, re-join your links\n');
+
+  // 1) find every live hub near the configured/default port (also detects split-brain)
+  const ports = [...new Set([PORT, ...Array.from({ length: 10 }, (_, i) => DEFAULT_PORT + i)])];
+  const live: { port: number; health: any }[] = [];
+  for (const p of ports) {
+    const h = await probeHub(p);
+    if (h) live.push({ port: p, health: h });
+  }
+  let port = PORT;
+  if (!live.length) {
+    console.log(`no live hub found near :${DEFAULT_PORT} — starting one on :${PORT}…`);
+    spawnDaemon(`http://${HOST}:${PORT}`);
+    let h = null;
+    for (let i = 0; i < 20 && !(h = await probeHub(PORT)); i++) await sleep(250);
+    if (!h) throw new Error(`hub did not come up on :${PORT} — check ${LOG_PATH}`);
+    console.log(`✓ hub started on :${PORT}`);
+  } else {
+    const chosen = live.find((l) => l.port === PORT) ?? live[0];
+    port = chosen.port;
+    console.log(`✓ live hub on :${port} (${chosen.health.links} links, ${chosen.health.messages} messages)`);
+    if (live.length > 1) {
+      console.log(`⚠ MULTIPLE hubs running (${live.map((l) => ':' + l.port).join(', ')}) — split-brain. Keeping :${port}; stop the others:`);
+      for (const l of live) if (l.port !== port) console.log(`    lsof -nP -ti :${l.port} | xargs kill`);
+    }
+    if (port !== PORT) {
+      writePortConfig(port);
+      console.log(`✓ port drift repaired — config now says :${port}; re-registering MCP URLs:`);
+      console.log(reRegister(port));
+      console.log('  (already-running sessions keep the old URL until restarted — use this CLI as transport meanwhile)');
+    }
+  }
+  const base = `http://127.0.0.1:${port}`;
+  const tok = getToken();
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (tok) headers['authorization'] = `Bearer ${tok}`;
+  const hub = async (method: string, route: string, body?: any) => {
+    const r = await fetch(`${base}${route}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    if (!r.ok) throw new Error(`${method} ${route} → ${r.status}`);
+    return r.json();
+  };
+
+  // 2) self-heal the on-disk toolkit (a wiped ~/.sonar loses these)
+  console.log(installNudgeHook());
+  console.log(installAgentGuide());
+
+  let branch = '';
+  try {
+    branch = execFileSync('git', ['branch', '--show-current'], { cwd, stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim();
+  } catch {
+    /* not a repo */
+  }
+
+  // 3) re-join links: an explicit --link, plus every link where this cwd/label already participates
+  const rejoined: string[] = [];
+  if (linkArg) {
+    const joinAs = label || `claude@${branch || 'main'}`;
+    await hub('POST', `/api/links/${linkArg}/join`, { label: joinAs, cwd, branch: branch || undefined });
+    rejoined.push(`${linkArg} as "${joinAs}"`);
+  }
+  const links: any[] = await hub('GET', '/api/links');
+  for (const l of links) {
+    if (l.id === linkArg) continue;
+    try {
+      const info = await hub('GET', `/api/links/${l.id}`);
+      const mine = (info.participants || []).filter((p: any) => p.cwd === cwd || (label && p.label === label));
+      if (!mine.length) continue;
+      const joinAs = label ?? (mine.find((p: any) => p.cwd === cwd) ?? mine[0]).label;
+      await hub('POST', `/api/links/${l.id}/join`, { label: joinAs, cwd, branch: branch || undefined });
+      rejoined.push(`${l.id} as "${joinAs}"`);
+    } catch {
+      /* skip unjoinable links */
+    }
+  }
+  console.log(
+    rejoined.length
+      ? `✓ re-joined: ${rejoined.join(', ')}`
+      : '· no links matched this cwd/label — nothing to re-join (sonar reconnect --link <id> to force, or link_join via MCP)'
+  );
+
+  // 4) unread + recovery brief
+  try {
+    const nud = await hub('POST', '/api/nudge', { cwd });
+    for (const a of nud.attention || [])
+      console.log(`✉ ${a.unread} unread for "${a.label}" on ${a.link_id} — read(link_id="${a.link_id}", from="${a.label}", since_seq=${a.after})`);
+  } catch {
+    /* nudge is best-effort here */
+  }
+  try {
+    const b = await hub('GET', `/api/brief?cwd=${encodeURIComponent(cwd)}`);
+    if (b.text) console.log(`\n${b.text}`);
+  } catch {
+    /* brief is best-effort here */
+  }
+  console.log(
+    `\nReconnected. If THIS session's MCP tools still fail: retry once (stale MCP sessions re-initialize on the next call). ` +
+      `If the hub PORT changed, this session's MCP stays dead until the session restarts — keep working through the CLI (sonar post/read/doc <id>).`
+  );
+}
+
 // Session-init awareness injected into every Claude/Codex session so it knows it
 // can spawn a worker / pull context from the start (not only after /sonar).
 const SESSION_INIT = `## sonar — multi-session coordination (available)
@@ -723,7 +878,7 @@ A local **sonar** MCP server is running, letting you coordinate with other Claud
 - **autopilot(on=true, cwd=…)** — makes the hub EXECUTE the task board: ready tasks are dispatched automatically (worker per unassigned task, wake for assigned ones), cascading through depends_on. Script a pipeline as tasks, enable autopilot, let it run.
 - Each link has a shared doc at ~/.sonar/links/<id>/context.md that is the source of truth; collaborate via doc_append / doc_read, ping with post / wait.
 - **Across machines/networks:** the human can run \`sonar tunnel\` (operator action) to share this hub with a remote teammate over a revocable token; suggest it if they want to collaborate with someone not on this machine.
-- **If sonar seems broken** (CLI "fetch failed"/EPERM, tools missing, nudges not firing, a peer never replies, your stop hangs on a hold): READ ~/.sonar/AGENTS.md — a self-help runbook with the fix per symptom. Most failures are your sandboxed shell or a stale session, not the hub; the MCP tools usually still work when the CLI cannot connect.
+- **If sonar seems broken** (CLI "fetch failed"/EPERM, tools missing, nudges not firing, a peer never replies, your stop hangs on a hold): run \`sonar reconnect\` — one command that finds/starts the live hub, fixes registration drift, and re-joins your links — and READ ~/.sonar/AGENTS.md, the self-help runbook with the fix per symptom. Most failures are your sandboxed shell or a stale session, not the hub; the MCP tools usually still work when the CLI cannot connect.
 Use this only when it genuinely helps — don't spawn workers for trivial tasks. If the sonar tools aren't listed, the hub may be down (run: sonar start).`;
 
 const CLAUDE_MD = path.join(os.homedir(), '.claude', 'CLAUDE.md');
@@ -1450,6 +1605,9 @@ Remote teammates (across networks):
   sonar connect <hub-url> [--token <t>]   point THIS machine's Claude/Codex at a remote sonar hub
 
 Terminal helpers (talk to the running hub):
+  sonar reconnect [--label <you>] [--cwd <dir>] [--link <id>]
+                       one-command recovery for a wonky session: find/start the live hub
+                       (even if it moved ports), fix registration drift, re-join your links
   sonar create [title]
   sonar post <id> <message…>
   sonar read <id> [since_seq]
@@ -1531,6 +1689,8 @@ const run = async () => {
       return cmdWatches(rest);
     case 'nudge':
       return cmdNudge(rest);
+    case 'reconnect':
+      return cmdReconnect(rest);
     case 'reindex':
       return cmdReindex();
     case 'worktrees':

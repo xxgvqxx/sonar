@@ -3,6 +3,7 @@
 Notable changes, newest first. Entries under **[Unreleased]** are auto-appended from commit subjects by `.githooks/post-commit` (enable in a clone with `git config core.hooksPath .githooks`); edit them freely and roll them under a version heading at release time.
 
 ## [Unreleased]
+- **2026-07-14** — Add `sonar reconnect` + self-heal a wiped ~/.sonar (hook file, guarded command)
 - **2026-07-13** — Add an agent self-help runbook (~/.sonar/AGENTS.md) so agents unstick themselves
 - **2026-07-13** — Surface the real network error (and the fix) when the CLI cannot reach the hub
 - **2026-07-13** — Add nudge: a Stop hook that auto-resumes agents on link activity, no tmux needed
