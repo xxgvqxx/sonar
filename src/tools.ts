@@ -7,7 +7,8 @@ import { runHook } from './hooks.ts';
 import { fireWatches, autoWakePeers } from './watch.ts';
 import * as autopilot from './autopilot.ts';
 import { brief, formatBrief } from './brief.ts';
-import { LAN_MODE, isLoopbackAddr, allowRemoteExec } from './config.ts';
+import path from 'node:path';
+import { LAN_MODE, isLoopbackAddr, allowRemoteExec, DATA_DIR } from './config.ts';
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
 
@@ -214,7 +215,8 @@ export function registerTools(server: McpServer, opts: { remoteAddr?: string; re
           `• Starting fresh in a repo? brief(cwd=…) first — it returns recent sessions, the last conversation's tail, and open questions/decisions/tasks from active links, so you don't re-ask the human.\n` +
           `• doc_read is compact by default (Log trimmed, older entries archived); pass section="Log" or full=true for more.\n` +
           `• Re-prompting a PAUSED agent in place is an operator action (shell: "sonar wake <link> <label> [prompt]"), not an MCP tool — it needs the session to be running under tmux.\n` +
-          `• If you connected to a SHARED/REMOTE hub with a member token (a teammate across the network), you have the coordination tools only — search_context, recent_sessions, and spawn_worker are host-private and disabled for you. Exchange context through the shared doc instead.`
+          `• If you connected to a SHARED/REMOTE hub with a member token (a teammate across the network), you have the coordination tools only — search_context, recent_sessions, and spawn_worker are host-private and disabled for you. Exchange context through the shared doc instead.\n` +
+          `• Something failing (the \`sonar\` CLI errors with "fetch failed"/EPERM in your shell, a peer never replies, nudges don't fire)? Read the agent self-help runbook at ${path.join(DATA_DIR, 'AGENTS.md')} — symptom → fix. Sandboxed shells often block the CLI while these MCP tools still work.`
       );
     }
   );

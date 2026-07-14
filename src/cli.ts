@@ -86,7 +86,9 @@ async function api(method: string, route: string, body?: any): Promise<any> {
         : code === 'ECONNREFUSED'
           ? 'nothing is listening on that port — start the hub with "sonar start" (or check "sonar status" and SONAR_PORT).'
           : 'is the hub running? Check "sonar status".';
-    throw new Error(`cannot reach the sonar hub at ${BASE_URL}${route} (${detail || String(cause?.message || e)}) — ${hint}`);
+    throw new Error(
+      `cannot reach the sonar hub at ${BASE_URL}${route} (${detail || String(cause?.message || e)}) — ${hint}\n(agent self-help runbook: ${AGENT_GUIDE_PATH})`
+    );
   }
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.json();
@@ -121,6 +123,7 @@ function lanIp(): string | undefined {
 async function cmdDaemon() {
   const { startServer } = await import('./server.ts');
   fs.mkdirSync(DATA_DIR, { recursive: true });
+  installAgentGuide(); // keep the self-help runbook present wherever the hub runs
   // Going LAN with no token? Generate a URL-safe one, persist it (merged with port), and hand it
   // to the live server via setToken so its auth middleware sees it. Log it so the operator can share.
   if (LAN_MODE) {
@@ -291,6 +294,7 @@ RULES:
 - ALWAYS surface to the user what the other agent said and what changed in the doc. Never go silent after posting.
 - Put substantive content in the DOC (doc_append), not just in chat pings.
 - Catch up with read(..., from=<your label>) (not bare read) so sonar knows you've seen the messages and stops nudging you about them.
+- Something failing (CLI "fetch failed"/EPERM, silent peer, stale MCP session)? Read ~/.sonar/AGENTS.md — the agent self-help runbook — before retrying or telling the user sonar is broken. Sandboxed shells often block the CLI while the MCP tools still work.
 - Waiting for something SPECIFIC (a task to finish, an answer, a file to free up)? Prefer watch(link_id, from, event, arg?) — tell the user a watch is armed, then end your turn; the hub pings the link (and can wake this session if it runs under tmux) when it fires.
 - A pipeline of tasks the user wants run without babysitting? task_add each step (depends_on to order them), then autopilot(on=true, cwd=<repo>) — the hub spawns/wakes per ready task and cascades as they finish. Quality gates still guard every "done".
 - Same repo as the other session? Use claim(resource, from) BEFORE editing a shared file (it returns a conflict instead of clobbering), the task board (task_add / task_update with status="doing"/"done", and depends_on to order work), and git_sync to share your branch / ahead-behind / changed files. All of these render into the doc.
@@ -337,6 +341,9 @@ Run  git branch --show-current  and  pwd  first. Use label "codex@<branch>", age
 
 ## Remote teammates
 Live back-and-forth needs the other session active on the same link at the same time; otherwise writes are saved for when it joins, or use spawn_worker. To collaborate with a teammate on ANOTHER machine/network, the human runs  sonar tunnel  (operator action — prints a connect command + a revocable token). NOTE: if THIS session is connected to a remote/shared hub with a member token, you get coordination tools only — spawn_worker and search_context are host-local and will be refused; use the doc.
+
+## If sonar seems broken
+Read ~/.sonar/AGENTS.md — the agent self-help runbook (symptom → fix). Common: a sandboxed shell blocks the \`sonar\` CLI with "fetch failed"/EPERM while the MCP tools still work; a silent peer may simply be un-wakeable (message is saved for when it next runs).
 `;
 }
 
@@ -406,6 +413,84 @@ function installCodex(url: string, token?: string): string {
     lines.push(`  Codex config: FAILED (${(e as Error).message})`);
   }
   return lines.join('\n');
+}
+
+// --------------------------------------------------------------------------
+// Agent self-help runbook — a PLAIN FILE agents can read to unstick themselves
+// precisely when the network path is broken (sandboxes block local connects
+// but allow file reads). Every failure surface points here: CLI errors, the
+// session-init block, /sonar, the Codex skill, and sonar_help.
+// --------------------------------------------------------------------------
+const AGENT_GUIDE_PATH = path.join(DATA_DIR, 'AGENTS.md');
+
+const AGENT_GUIDE = `# sonar — agent self-help (read this when sonar seems broken)
+
+You are an AI agent (Claude Code / Codex). A sonar call failed, a peer went silent, or nudges
+aren't firing. Find your symptom below and apply the fix. Everything here is safe to do without
+asking the human unless noted. Most "sonar is broken" reports are YOUR sandbox or a stale
+session — the hub is usually fine.
+
+## "TypeError: fetch failed" / "connect EPERM 127.0.0.1:<port>" from the \`sonar\` CLI or node fetch
+Your SHELL is sandboxed and the sandbox denies local-network connects. The hub is probably healthy.
+- FIX 1 (preferred): use the sonar MCP TOOLS (read, post, doc_read, doc_append, wait, task_*, …)
+  instead of the CLI. MCP calls run in your host process, not your sandboxed shell — not blocked.
+- FIX 2: re-run the command outside the sandbox (in Claude Code, run it with sandbox disabled —
+  the human may need to approve).
+- Do NOT retry the same command inside the sandbox; it will never work.
+
+## "ECONNREFUSED" — nothing listening on the port
+The hub is not running (or moved ports). Run \`sonar start\`. Port resolution: SONAR_PORT env →
+"port" in ~/.sonar/config.json → 7610. \`sonar status\` shows the live port.
+
+## The sonar MCP tools aren't listed at all
+Either the hub is down (\`sonar start\`), or your session started before \`sonar install\`
+registered the MCP server. Registration is picked up at session start — you cannot fix this
+yourself; tell the human to restart your session.
+
+## An MCP tool call fails with a session/transport error after working earlier
+The hub restarted and your MCP session went stale. Retry ONCE (clients re-initialize on the next
+call). Still failing → tell the human to restart your session.
+
+## You posted a question and no reply ever comes
+- The peer may be un-wakeable: Codex sessions have no Stop hook, and sessions not under tmux
+  cannot be injected. Your message IS saved — the peer sees it whenever it next runs.
+- Verify the peer is on the link (link_info) and check their last activity (doc_read).
+- Separable task? spawn_worker(link_id, task=…) launches a worker that WILL respond.
+- Never loop wait() endlessly: post → end your turn (the nudge resumes you when the reply lands),
+  or arm watch(event="message") and go idle.
+
+## You keep getting nudged about messages you already read
+Catch up with read(link_id, from="<YOUR label>") — from= is what advances your unread cursor;
+bare read() does not. wait() advances it too.
+
+## The nudge (Stop hook) never fires for you
+- It only exists in sessions started AFTER \`sonar install\` (hooks snapshot at session start).
+- It only engages for links YOUR transcript mentions, with ≥2 participants and activity in the
+  last 45 min. \`sonar nudge status\` shows enabled / hook / hold / cap.
+- Codex sessions never get nudges (no hook system) — use tmux auto-wake or wait() loops there.
+
+## Your turn end hangs for minutes on "Stop hook running"
+That is the nudge HOLD: you spoke last on an active link, so your stop is held awaiting the reply
+(default 10 min, capped 15). It releases the instant the peer posts. If the collaboration is
+actually over, post "✅ done" on the link first — then the hold never engages. Tune or disable:
+\`sonar nudge hold <seconds>\` / \`sonar nudge off\`.
+
+## When a collaboration finishes
+Post a final "✅ done" on the link so the other side's held stop releases immediately instead of
+waiting out its window.
+
+_(This file is (re)written by \`sonar install\` — do not hand-edit; it will be overwritten.)_
+`;
+
+/** Write the agent self-help runbook (idempotent; also refreshed at daemon boot so it always exists). */
+function installAgentGuide(): string {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(AGENT_GUIDE_PATH, AGENT_GUIDE);
+    return `  Agent self-help: ${AGENT_GUIDE_PATH} written (referenced by CLI errors + session-init)`;
+  } catch (e) {
+    return `  Agent self-help: FAILED writing ${AGENT_GUIDE_PATH} (${(e as Error).message})`;
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -638,6 +723,7 @@ A local **sonar** MCP server is running, letting you coordinate with other Claud
 - **autopilot(on=true, cwd=…)** — makes the hub EXECUTE the task board: ready tasks are dispatched automatically (worker per unassigned task, wake for assigned ones), cascading through depends_on. Script a pipeline as tasks, enable autopilot, let it run.
 - Each link has a shared doc at ~/.sonar/links/<id>/context.md that is the source of truth; collaborate via doc_append / doc_read, ping with post / wait.
 - **Across machines/networks:** the human can run \`sonar tunnel\` (operator action) to share this hub with a remote teammate over a revocable token; suggest it if they want to collaborate with someone not on this machine.
+- **If sonar seems broken** (CLI "fetch failed"/EPERM, tools missing, nudges not firing, a peer never replies, your stop hangs on a hold): READ ~/.sonar/AGENTS.md — a self-help runbook with the fix per symptom. Most failures are your sandboxed shell or a stale session, not the hub; the MCP tools usually still work when the CLI cannot connect.
 Use this only when it genuinely helps — don't spawn workers for trivial tasks. If the sonar tools aren't listed, the hub may be down (run: sonar start).`;
 
 const CLAUDE_MD = path.join(os.homedir(), '.claude', 'CLAUDE.md');
@@ -705,6 +791,7 @@ async function cmdInstall() {
   console.log(installCodex(url, tok));
   console.log(installSessionInit());
   console.log(installNudgeHook());
+  console.log(installAgentGuide());
   console.log('\nStarting the hub...');
   spawnDaemon(`http://${HOST}:${port}`);
   console.log('\nDone. Restart Claude Code / Codex so they pick up the new MCP server + session-init note.');

@@ -48,6 +48,7 @@ sonar install            # or: node src/cli.ts install
 - adds `[mcp_servers.sonar]` to **`~/.codex/config.toml`** and writes a Codex `sonar` skill,
 - appends a small **session‑init block** to `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` so every session knows, from startup, that it can spawn a worker / search context when useful (idempotent, bounded by `<!-- sonar:begin -->`…`<!-- sonar:end -->`),
 - installs the **nudge** — a Claude Code **Stop hook** (`~/.sonar/nudge.mjs`, registered in `~/.claude/settings.json`) that auto‑resumes a session when link activity is waiting for it, so agents converse without a human typing "check sonar" (see [Nudge](#nudge--agents-resume-on-their-own-no-tmux-required)),
+- writes an **agent self‑help runbook** to `~/.sonar/AGENTS.md` (symptom → fix: sandboxed‑shell EPERM vs the CLI, stale MCP sessions, silent peers, hold behavior). It's a plain file, so agents can read it even when their sandbox blocks the network; CLI errors, the session‑init block, `/sonar`, and `sonar_help` all point to it,
 - starts the hub.
 
 > **Restart Claude Code / Codex afterwards** so they pick up the new MCP tools and instructions.
